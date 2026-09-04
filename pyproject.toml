@@ -52,6 +52,14 @@ strict = true
 warn_unreachable = true
 
 [[tool.mypy.overrides]]
+# The ported Granola client ran from cron without a virtualenv, so it is
+# stdlib-only and untyped. Porting it to strict is its own change; doing it
+# in the same PR that moves the file would bury the move in the diff.
+# Tracked as Cortex-b4o.2 follow-up.
+module = "cortex_granola.granola.*"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
 module = "cortex_utils.*"
 ignore_missing_imports = true
 

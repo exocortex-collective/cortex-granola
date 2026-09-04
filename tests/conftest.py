@@ -9,6 +9,7 @@ are all invisible to a mock, which hands back whatever the code asked for.
 from __future__ import annotations
 
 import os
+import pathlib
 from collections.abc import Iterator
 
 import psycopg2
@@ -53,3 +54,37 @@ def conn(dsn: str) -> Iterator[psycopg2.extensions.connection]:
     finally:
         connection.rollback()
         connection.close()
+
+
+@pytest.fixture
+def schema(conn: psycopg2.extensions.connection) -> psycopg2.extensions.connection:
+    """A connection with the queue schema and this service's tables in place.
+
+    Committed, not rolled back: `ensure_queue_schema` creates partitions, which
+    needs its own transaction, and every test in the session shares the result.
+    Test DATA still rolls back -- only the DDL persists.
+    """
+    from cortex_utils.queue import ensure_queue_schema
+
+    ensure_queue_schema(conn)
+    ddl = pathlib.Path(__file__).resolve().parents[1] / "migrations" / "001_granola_schema.sql"
+    with conn.cursor() as cur:
+        cur.execute(ddl.read_text())
+    conn.commit()
+    return conn
+
+
+@pytest.fixture
+def clean(schema: psycopg2.extensions.connection) -> psycopg2.extensions.connection:
+    """Schema in place and this service's tables empty.
+
+    The raw table cascades to every derived table, so one TRUNCATE clears the
+    lot. The shared `queue` table is filtered by queue_name rather than
+    truncated -- other Cortex services use it, and a test that truncates it
+    would delete their work.
+    """
+    with schema.cursor() as cur:
+        cur.execute("TRUNCATE granola_notes_raw CASCADE")
+        cur.execute("DELETE FROM queue WHERE queue_name = 'granola_parse'")
+    schema.commit()
+    return schema
