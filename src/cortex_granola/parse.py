@@ -21,7 +21,7 @@ import structlog
 from psycopg2 import sql
 from psycopg2.extras import Json, execute_values
 
-from cortex_granola.granola.render import _parse_ts
+from cortex_granola.granola.render import note_timestamp
 
 log = structlog.get_logger(__name__)
 
@@ -160,12 +160,8 @@ def _meeting_date(raw: dict[str, Any]) -> dt.date | None:
     NULL says "unknown", which is true and stable. The export worker decides
     what to do with an undated note; it is not this function's guess to make.
     """
-    event = raw.get("calendar_event") or {}
-    for value in (event.get("scheduled_start_time"), raw.get("created_at")):
-        parsed = _parse_ts(value)
-        if parsed:
-            return parsed.date()
-    return None
+    when = note_timestamp(raw)
+    return when.date() if when else None
 
 
 def _write_transcript(

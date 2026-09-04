@@ -15,14 +15,31 @@ import unicodedata
 MAX_SLUG = 60
 
 
-def note_date(note: dict) -> dt.datetime:
-    """Prefer the scheduled meeting time; fall back to note creation."""
+def note_timestamp(note: dict) -> dt.datetime | None:
+    """The meeting's instant, or None when the note carries no usable one.
+
+    The single definition of that precedence. It had two: this one and
+    parse.py's, which meant a future change to the order would move where a
+    note is FILED without moving the meeting_date it is filed UNDER -- the same
+    note under two different dates depending on which code path you asked.
+    """
     event = note.get("calendar_event") or {}
     for value in (event.get("scheduled_start_time"), note.get("created_at")):
         parsed = _parse_ts(value)
         if parsed:
             return parsed
-    return dt.datetime.now(dt.UTC)
+    return None
+
+
+def note_date(note: dict) -> dt.datetime:
+    """Prefer the scheduled meeting time; fall back to now for a filename.
+
+    The fallback exists because a file needs a name even when a note has no
+    timestamp. It must not reach the database -- see parse._meeting_date, which
+    stores NULL for exactly this case rather than a value that changes on every
+    re-parse.
+    """
+    return note_timestamp(note) or dt.datetime.now(dt.UTC)
 
 
 def relative_path(note: dict) -> str:
