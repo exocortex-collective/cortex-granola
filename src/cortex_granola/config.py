@@ -125,17 +125,26 @@ def _read_key_file(path: Path) -> str:
 def schema_sql() -> str:
     """The DDL this service applies at boot, read as package data.
 
+    Concatenated in filename order rather than applied one file at a time: the
+    statements are individually idempotent (IF NOT EXISTS throughout), so the
+    whole thing is safe to re-run, and one string keeps the boot path a single
+    execute rather than a loop with partial-failure states.
+
     Not `Path(__file__).parents[2] / "migrations"`. That walked up to a
     repo-root sibling of `src/`, which exists in a source checkout and in
     nothing else: the wheel packages `cortex_granola` only, so an installed
     container -- which is how every service in this family runs -- would raise
     FileNotFoundError at boot, on the first line of work rather than at build.
     """
-    return (
-        resources.files("cortex_granola.migrations")
-        .joinpath("001_granola_schema.sql")
-        .read_text(encoding="utf-8")
-    )
+    files = resources.files("cortex_granola.migrations")
+    # Discovered from the directory, not a hand-maintained list. A tuple here
+    # meant a new migration file could be added and silently never applied --
+    # no error, no failing test, just a column that is not there at runtime.
+    # Sorted by filename, which is what the NNN_ prefix is for.
+    names = sorted(entry.name for entry in files.iterdir() if entry.name.endswith(".sql"))
+    if not names:
+        raise RuntimeError("no .sql migrations found in cortex_granola.migrations")
+    return "\n".join(files.joinpath(name).read_text(encoding="utf-8") for name in names)
 
 
 def _split(value: str | None) -> list[str]:
