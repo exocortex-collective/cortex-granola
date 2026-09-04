@@ -72,6 +72,12 @@ def _rfc3339(when: datetime) -> str:
     Nothing in the test suite could have caught it either: the fake client
     accepts any string. Only a real API rejects this one.
     """
+    if when.tzinfo is None:
+        # astimezone() on a naive datetime silently assumes LOCAL time, which
+        # would shift the window by the machine's offset and skip notes. It is
+        # tz-aware today because last_synced_at is a TIMESTAMPTZ, but that is
+        # an invariant somewhere else, so say so here rather than inherit it.
+        raise ValueError(f"refusing to format a naive datetime as UTC: {when!r}")
     return when.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 

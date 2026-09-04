@@ -22,8 +22,8 @@ import re
 from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
-from typing import Any
 
+import psycopg2
 from cortex_utils.config import PostgresConfig
 
 
@@ -128,18 +128,22 @@ def _read_key_file(path: Path) -> str:
 # identical CREATE: two of them race in pg_type and one dies with a
 # UniqueViolation. restart: unless-stopped papered over it, which is worse than
 # the crash -- a container flapping on boot reads as "Up" and hides the reason.
-SCHEMA_LOCK_KEY = 0x67524E4C  # "gRNL"
+SCHEMA_LOCK_NAME = "cortex_granola_schema"
 
 
-def apply_schema(conn: Any) -> None:
+def apply_schema(conn: psycopg2.extensions.connection) -> None:
     """Apply the migrations under an advisory lock, in one transaction.
+
+    COMMITS. Not composable inside a larger transaction -- the lock is
+    xact-scoped, so holding it open would block every other service's boot for
+    as long as the caller's transaction ran.
 
     pg_advisory_xact_lock blocks rather than failing, and releases at commit or
     rollback, so a crash mid-apply cannot strand the lock. The second service
     to arrive waits, then runs the same idempotent DDL and finds nothing to do.
     """
     with conn.cursor() as cur:
-        cur.execute("SELECT pg_advisory_xact_lock(%s)", (SCHEMA_LOCK_KEY,))
+        cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (SCHEMA_LOCK_NAME,))
         cur.execute(schema_sql())
     conn.commit()
 
