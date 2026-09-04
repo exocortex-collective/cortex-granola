@@ -411,3 +411,79 @@ def test_links_resolve_when_the_trees_are_nested_differently(
         if line.startswith("transcript_file:")
     )
     assert (note.parent / link).resolve().exists()
+
+
+# --- symlinks and permissions ---------------------------------------------
+
+
+def test_a_symlink_inside_the_root_is_refused(tmp_path: Path) -> None:
+    """Containment is not enough. A symlink planted inside the vault points at
+    a real file that is ALSO inside the vault, so a containment-only check
+    passes and the delete lands on a file this worker never wrote.
+    """
+    root = tmp_path / "notes"
+    (root / "2026").mkdir(parents=True)
+    victim = root / "2026" / "victim.md"
+    victim.write_text("someone else's note")
+    link = root / "2026" / "exported.md"
+    link.symlink_to(victim)
+
+    with pytest.raises(ExportPathError, match="symlink"):
+        safe_target(root, "2026/exported.md")
+
+
+def test_a_symlinked_directory_component_is_refused(tmp_path: Path) -> None:
+    """The symlink need not be the leaf. A symlinked YEAR directory redirects
+    every note filed under it."""
+    root = tmp_path / "notes"
+    root.mkdir(parents=True)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (root / "2026").symlink_to(elsewhere)
+
+    with pytest.raises(ExportPathError, match="symlink"):
+        safe_target(root, "2026/note.md")
+
+
+def test_a_symlink_is_not_deleted_through(tmp_path: Path) -> None:
+    """The regression, stated as the invariant it protects: nothing is deleted
+    that this worker did not write."""
+    root = tmp_path / "notes"
+    (root / "2026").mkdir(parents=True)
+    victim = root / "2026" / "victim.md"
+    victim.write_text("mine")
+    (root / "2026" / "exported.md").symlink_to(victim)
+
+    with pytest.raises(ExportPathError):
+        remove_recorded(root, "2026/exported.md")
+    assert victim.read_text() == "mine", "the victim must survive"
+
+
+def test_an_exported_file_is_readable_by_more_than_its_owner(tmp_path: Path) -> None:
+    """mkstemp creates 0600 and rename does not adopt the replaced file's mode,
+    so without an explicit chmod every export silently narrowed the file to
+    owner-only -- which a vault read by sync or backup tooling notices and the
+    user does not, until it stops working."""
+    target = tmp_path / "notes" / "2026" / "a.md"
+    write_atomically(target, "hello")
+    mode = target.stat().st_mode & 0o777
+    assert mode & 0o044, f"mode {mode:o} is not readable beyond the owner"
+
+
+def test_a_re_export_does_not_narrow_an_existing_file(tmp_path: Path) -> None:
+    target = tmp_path / "notes" / "a.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("first")
+    target.chmod(0o644)
+
+    write_atomically(target, "second")
+
+    assert target.stat().st_mode & 0o777 == 0o644 & ~_umask()
+
+
+def _umask() -> int:
+    import os
+
+    current = os.umask(0)
+    os.umask(current)
+    return current

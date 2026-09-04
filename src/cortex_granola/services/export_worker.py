@@ -33,6 +33,13 @@ DEFAULT_POLL_INTERVAL_S = 30
 
 # Tombstoned notes first: removing a note the user excluded is more urgent than
 # writing one they added, and a large backfill must not delay it.
+#
+# This leans on one assumption worth naming, because it is the kind that fails
+# silently: fetched_at must advance whenever export-relevant content changes.
+# ingest_one() bumps it only when api_updated_at moves or a tombstone clears,
+# so if Granola ever returns changed content under an unchanged updated_at, the
+# export for that note never fires and nothing reports it -- the same shape the
+# watermark charter warns about. Tracked as Cortex-b4o.14.
 _PENDING = """
     SELECT r.granola_id
       FROM granola_notes_raw r

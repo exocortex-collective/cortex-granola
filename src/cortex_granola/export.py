@@ -55,18 +55,40 @@ class ExportStats:
 
 
 def safe_target(root: Path, relative: str) -> Path:
-    """Resolve `relative` under `root`, refusing anything that escapes it.
+    """Resolve `relative` under `root`, refusing escapes AND symlinks.
 
-    Resolution happens BEFORE the check, not after: '../../etc/passwd' only
-    looks like an escape once resolved, and a check on the unresolved string
-    passes it. Note titles reach filenames through slugify, and titles come from
-    an external API, so this is a boundary rather than a formality.
+    Two separate refusals, because they defeat different attacks:
+
+    * Resolution happens BEFORE the containment check, since '../../etc/passwd'
+      only looks like an escape once resolved and a check on the raw string
+      passes it. Note titles reach filenames through slugify and titles come
+      from an external API.
+
+    * No component may be a symlink. Containment alone is not enough: a symlink
+      planted INSIDE the vault -- which Obsidian users do deliberately -- points
+      at a real file that is also inside the vault, so the containment check
+      passes and the delete lands on a file this worker never wrote. That
+      breaks the one invariant this module has. Verified by review: replacing a
+      recorded path with a symlink to an unrelated note deleted the unrelated
+      note and left the symlink dangling.
+
+    Refusing rather than following is right for both: this worker only ever
+    touches paths it recorded writing, and it never wrote a symlink.
     """
     root = root.resolve()
-    target = (root / relative).resolve()
+    literal = root / relative
+    target = literal.resolve()
     if target != root and root not in target.parents:
         raise ExportPathError(f"{target} is outside the export root {root}")
-    return target
+
+    # Walk down from the root rather than up from the leaf, so a symlink at any
+    # depth is caught even when the leaf itself does not exist yet.
+    current = root
+    for part in Path(relative).parts:
+        current = current / part
+        if current.is_symlink():
+            raise ExportPathError(f"{current} is a symlink; refusing to follow it into the vault")
+    return literal
 
 
 def write_atomically(target: Path, content: str) -> None:
@@ -82,6 +104,14 @@ def write_atomically(target: Path, content: str) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(content)
+        # mkstemp always creates 0600 and rename does not adopt the replaced
+        # file's mode, so without this every export -- including a re-export of
+        # an existing note -- silently narrowed it to owner-only. A vault read
+        # by sync or backup tooling notices; the user does not, until it stops
+        # working.
+        umask = os.umask(0)
+        os.umask(umask)
+        tmp.chmod(0o666 & ~umask)
         tmp.replace(target)
     except BaseException:
         tmp.unlink(missing_ok=True)
@@ -95,6 +125,10 @@ def remove_recorded(root: Path, relative: str) -> bool:
     refusing to clear the record for it would strand the row forever.
     """
     target = safe_target(root, relative)
+    if target.is_symlink():
+        # safe_target already refuses these; belt and braces, because this is
+        # the line that actually destroys something.
+        raise ExportPathError(f"{target} is a symlink; refusing to delete through it")
     existed = target.exists()
     target.unlink(missing_ok=True)
     return existed
