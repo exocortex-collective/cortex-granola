@@ -122,8 +122,16 @@ def _read_key_file(path: Path) -> str:
     )
 
 
+MIGRATIONS = ("001_granola_schema.sql", "002_exported_files.sql")
+
+
 def schema_sql() -> str:
     """The DDL this service applies at boot, read as package data.
+
+    Concatenated in filename order rather than applied one file at a time: the
+    statements are individually idempotent (IF NOT EXISTS throughout), so the
+    whole thing is safe to re-run, and one string keeps the boot path a single
+    execute rather than a loop with partial-failure states.
 
     Not `Path(__file__).parents[2] / "migrations"`. That walked up to a
     repo-root sibling of `src/`, which exists in a source checkout and in
@@ -131,11 +139,8 @@ def schema_sql() -> str:
     container -- which is how every service in this family runs -- would raise
     FileNotFoundError at boot, on the first line of work rather than at build.
     """
-    return (
-        resources.files("cortex_granola.migrations")
-        .joinpath("001_granola_schema.sql")
-        .read_text(encoding="utf-8")
-    )
+    files = resources.files("cortex_granola.migrations")
+    return "\n".join(files.joinpath(name).read_text(encoding="utf-8") for name in MIGRATIONS)
 
 
 def _split(value: str | None) -> list[str]:
