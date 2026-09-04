@@ -146,3 +146,156 @@ def test_schema_sql_is_readable_as_package_data() -> None:
     installed container has no repo to be relative to."""
     sql = schema_sql()
     assert "CREATE TABLE IF NOT EXISTS granola_notes_raw" in sql
+
+
+# --- secrets from a mounted file ------------------------------------------
+
+
+def test_the_api_key_can_come_from_a_mounted_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """How the container gets it: ~/cortex-secrets mounted read-only and the
+    path passed in, matching GMAIL_TOKEN_PATH. The key never enters compose,
+    so it never enters `docker inspect` output."""
+    keyfile = tmp_path / "granola.env"
+    keyfile.write_text("grn_from_file\n")
+    monkeypatch.setenv("GRANOLA_API_KEY_FILE", str(keyfile))
+    assert GranolaSyncConfig.from_env().api_key == "grn_from_file"
+
+
+def test_a_key_file_in_env_format_yields_the_value_not_the_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """~/cortex-secrets/granola.env holds GRANOLA_API_KEY=grn_...
+
+    Reading it whole would send the literal 'GRANOLA_API_KEY=grn_...' as the
+    bearer token -- a 401 that reads like a bad key rather than a bad parse.
+    """
+    keyfile = tmp_path / "granola.env"
+    keyfile.write_text("GRANOLA_API_KEY=grn_real_value\n")
+    monkeypatch.setenv("GRANOLA_API_KEY_FILE", str(keyfile))
+    assert GranolaSyncConfig.from_env().api_key == "grn_real_value"
+
+
+def test_the_env_var_wins_over_the_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    keyfile = tmp_path / "granola.env"
+    keyfile.write_text("grn_from_file\n")
+    monkeypatch.setenv("GRANOLA_API_KEY_FILE", str(keyfile))
+    monkeypatch.setenv("GRANOLA_API_KEY", "grn_from_env")
+    assert GranolaSyncConfig.from_env().api_key == "grn_from_env"
+
+
+def test_an_unreadable_key_file_is_a_clear_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A missing mount should say so, not surface later as an auth failure."""
+    monkeypatch.setenv("GRANOLA_API_KEY_FILE", str(tmp_path / "nope.env"))
+    with pytest.raises(ValueError, match="unreadable"):
+        GranolaSyncConfig.from_env()
+
+
+def test_an_empty_key_file_is_rejected(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    keyfile = tmp_path / "granola.env"
+    keyfile.write_text("\n")
+    monkeypatch.setenv("GRANOLA_API_KEY_FILE", str(keyfile))
+    with pytest.raises(ValueError, match="empty"):
+        GranolaSyncConfig.from_env()
+
+
+def test_neither_source_is_a_clear_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    with pytest.raises(ValueError, match="GRANOLA_API_KEY_FILE"):
+        GranolaSyncConfig.from_env()
+
+
+def test_dsn_from_env_needs_no_credential() -> None:
+    """The parse worker asks for this and nothing else."""
+    from cortex_granola.config import dsn_from_env
+
+    assert "dbname=" in dsn_from_env()
+
+
+@pytest.mark.parametrize(
+    "content,expected",
+    [
+        ("grn_plain\n", "grn_plain"),
+        ("GRANOLA_API_KEY=grn_assigned\n", "grn_assigned"),
+        ("export GRANOLA_API_KEY=grn_exported\n", "grn_exported"),
+        ('GRANOLA_API_KEY="grn_quoted"\n', "grn_quoted"),
+        # Regression: a bare key containing "=" was truncated to what followed
+        # the first "=", silently, because the parser sniffed for "=" instead of
+        # looking for an assignment.
+        ("grn_abc=123XYZ==\n", "grn_abc=123XYZ=="),
+        # Regression: a leading comment meant the sniff never matched, so the
+        # WHOLE multi-line blob was returned and sent as the bearer token.
+        ("# cortex secrets\n\nGRANOLA_API_KEY=grn_after_comment\n", "grn_after_comment"),
+        ("\n\nGRANOLA_API_KEY=grn_after_blank\n", "grn_after_blank"),
+    ],
+)
+def test_key_file_shapes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, content: str, expected: str
+) -> None:
+    keyfile = tmp_path / "granola.env"
+    keyfile.write_text(content)
+    monkeypatch.setenv("GRANOLA_API_KEY_FILE", str(keyfile))
+    assert GranolaSyncConfig.from_env().api_key == expected
+
+
+def test_an_ambiguous_key_file_is_refused(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Several lines and no assignment: guessing which one is the key is how
+    the first version shipped a bug. Say so instead."""
+    keyfile = tmp_path / "granola.env"
+    keyfile.write_text("grn_one\ngrn_two\n")
+    monkeypatch.setenv("GRANOLA_API_KEY_FILE", str(keyfile))
+    with pytest.raises(ValueError, match="cannot tell which line"):
+        GranolaSyncConfig.from_env()
+
+
+def test_a_comments_only_key_file_is_empty(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    keyfile = tmp_path / "granola.env"
+    keyfile.write_text("# nothing here\n\n")
+    monkeypatch.setenv("GRANOLA_API_KEY_FILE", str(keyfile))
+    with pytest.raises(ValueError, match="empty"):
+        GranolaSyncConfig.from_env()
+
+
+def test_an_assignment_with_no_value_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regression: `GRANOLA_API_KEY=` matched the assignment and returned "",
+    so the container booted with an empty bearer token and failed later as an
+    opaque 401 -- the same shape as the bug this parser replaced."""
+    keyfile = tmp_path / "granola.env"
+    keyfile.write_text("GRANOLA_API_KEY=\n")
+    monkeypatch.setenv("GRANOLA_API_KEY_FILE", str(keyfile))
+    with pytest.raises(ValueError, match="empty value"):
+        GranolaSyncConfig.from_env()
+
+
+@pytest.mark.parametrize(
+    "content", ['GRANOLA_API_KEY=""\n', "GRANOLA_API_KEY=''\n", "GRANOLA_API_KEY=   \n"]
+)
+def test_a_quoted_or_padded_empty_value_is_also_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, content: str
+) -> None:
+    keyfile = tmp_path / "granola.env"
+    keyfile.write_text(content)
+    monkeypatch.setenv("GRANOLA_API_KEY_FILE", str(keyfile))
+    with pytest.raises(ValueError, match="empty value"):
+        GranolaSyncConfig.from_env()
+
+
+def test_a_value_containing_a_hash_is_preserved(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No inline-comment stripping: a # inside the key is part of the key."""
+    keyfile = tmp_path / "granola.env"
+    keyfile.write_text("GRANOLA_API_KEY=grn_a#b\n")
+    monkeypatch.setenv("GRANOLA_API_KEY_FILE", str(keyfile))
+    assert GranolaSyncConfig.from_env().api_key == "grn_a#b"
+
+
+def test_crlf_line_endings_are_handled(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    keyfile = tmp_path / "granola.env"
+    keyfile.write_bytes(b"# comment\r\nGRANOLA_API_KEY=grn_crlf\r\n")
+    monkeypatch.setenv("GRANOLA_API_KEY_FILE", str(keyfile))
+    assert GranolaSyncConfig.from_env().api_key == "grn_crlf"

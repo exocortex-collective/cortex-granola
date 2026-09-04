@@ -14,7 +14,6 @@ import pytest
 from cortex_utils.queue import enqueue
 from psycopg2.extras import Json
 
-from cortex_granola.config import GranolaSyncConfig
 from cortex_granola.ingest import PARSE_QUEUE
 from cortex_granola.services.parse_worker import ParseWorker
 
@@ -23,7 +22,7 @@ NOTE = "not_worker0001"
 
 @pytest.fixture
 def worker(dsn: str, clean: psycopg2.extensions.connection) -> ParseWorker:
-    return ParseWorker(GranolaSyncConfig(api_key="grn_test", dsn=dsn), batch_size=5)
+    return ParseWorker(dsn, batch_size=5)
 
 
 def _store_raw(conn: psycopg2.extensions.connection, note_id: str = NOTE) -> None:

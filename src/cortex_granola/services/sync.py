@@ -15,6 +15,7 @@ without touching either:
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -24,6 +25,7 @@ from typing import Any
 
 import psycopg2
 import structlog
+from cortex_utils.metrics import start_metrics_server
 from cortex_utils.queue import ensure_queue_schema
 
 from cortex_granola.config import GranolaSyncConfig, schema_sql
@@ -470,3 +472,12 @@ class GranolaSync:
                 },
             )
             conn.commit()
+
+
+def main() -> None:
+    start_metrics_server(port=int(os.environ.get("METRICS_PORT", "8000")))
+    GranolaSync(GranolaSyncConfig.from_env()).run()
+
+
+if __name__ == "__main__":
+    main()
