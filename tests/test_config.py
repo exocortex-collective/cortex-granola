@@ -9,6 +9,7 @@ symptom appears much later and looks like a different bug.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -18,14 +19,14 @@ from cortex_granola.config import ExportConfig, GranolaSyncConfig, schema_sql
 
 @pytest.fixture(autouse=True)
 def _clear_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in list(os_environ_names()):
+    """Start every test from an empty GRANOLA_/POSTGRES_ environment.
+
+    A developer with GRANOLA_DENY_FOLDERS exported would otherwise see
+    from_env() tests pass or fail on their shell rather than on the code.
+    monkeypatch restores the real values per test.
+    """
+    for name in [k for k in os.environ if k.startswith(("GRANOLA_", "POSTGRES_"))]:
         monkeypatch.delenv(name, raising=False)
-
-
-def os_environ_names() -> list[str]:
-    import os
-
-    return [k for k in os.environ if k.startswith("GRANOLA_") or k.startswith("POSTGRES_")]
 
 
 def _min_env(monkeypatch: pytest.MonkeyPatch) -> None:

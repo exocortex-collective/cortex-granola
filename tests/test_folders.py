@@ -145,9 +145,31 @@ def test_resolution_is_immutable(folders: list[dict[str, Any]]) -> None:
 
 def test_an_empty_deny_list_excludes_nothing(folders: list[dict[str, Any]]) -> None:
     r = resolve_deny_list(folders, [], [])
-    assert r == DenyResolution(frozenset(), frozenset(), (), (), (), ())
+    assert r == DenyResolution(
+        folder_ids=frozenset(),
+        space_ids=frozenset(),
+        matched_folder_names=(),
+        matched_space_names=(),
+        unmatched_folders=(),
+        unmatched_spaces=(),
+    )
 
 
 def test_terms_are_stripped(folders: list[dict[str, Any]]) -> None:
     """Deny lists come from a comma-separated env var, so whitespace is normal."""
     assert resolve_deny_list(folders, ["  Bus Dev  "], []).folder_ids
+
+
+def test_matched_names_keep_folder_and_space_provenance(folders: list[dict[str, Any]]) -> None:
+    """The matched_* fields exist so a startup summary can say what a deny term
+    actually resolved to. Untested, they were free to record the wrong side."""
+    r = resolve_deny_list(folders, ["Bus Dev"], [SPACE_NAME])
+    assert r.matched_folder_names == ("Bus Dev",)
+    assert r.matched_space_names == (SPACE_NAME,)
+
+
+def test_a_folder_matched_by_id_reports_its_name(folders: list[dict[str, Any]]) -> None:
+    """Matching by id but reporting by name is the point: an operator who denied
+    fol_bus wants the warning to say Bus Dev."""
+    r = resolve_deny_list(folders, ["fol_bus"], [])
+    assert r.matched_folder_names == ("Bus Dev",)

@@ -9,6 +9,7 @@ are all invisible to a mock, which hands back whatever the code asked for.
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Iterator
 
 import psycopg2
@@ -43,7 +44,11 @@ def dsn() -> str:
     pytest.skip("CORTEX_TEST_DSN is not set")
 
 
-_TEST_DB_MARKERS = ("test", "postgres")
+# Exact names that are disposable by definition: `postgres` is the CI service
+# container's default database, created and destroyed per job.
+_DISPOSABLE_DB_NAMES = frozenset({"postgres"})
+# A dbname is also disposable if one of its _/- separated segments is this.
+_TEST_SEGMENT = "test"
 
 
 def _refuse_non_test_database(dsn: str) -> None:
@@ -66,12 +71,28 @@ def _refuse_non_test_database(dsn: str) -> None:
             dbname = val
     if not dbname:
         raise RuntimeError(f"CORTEX_TEST_DSN names no dbname: {dsn!r}")
-    if not any(marker in dbname.lower() for marker in _TEST_DB_MARKERS):
+    if not _is_disposable(dbname):
         raise RuntimeError(
             f"refusing to run destructive fixtures against dbname={dbname!r}; "
-            f"CORTEX_TEST_DSN must name a disposable database "
-            f"(one containing {' or '.join(_TEST_DB_MARKERS)})"
+            f"CORTEX_TEST_DSN must name a disposable database -- exactly "
+            f"{sorted(_DISPOSABLE_DB_NAMES)}, or one with a '{_TEST_SEGMENT}' "
+            f"segment such as 'cortex_test'"
         )
+
+
+def _is_disposable(dbname: str) -> bool:
+    """Segment match, not substring.
+
+    `"test" in dbname` was the first version of this, and it admits `protest`,
+    `greatest` and `attestation` -- a guard whose whole reason for existing is
+    that production and scratch "differ by one word in an env var", defeated by
+    a word that merely contains the marker. `postgres` as a substring marker was
+    worse still: it let `postgres_prod` through.
+    """
+    lowered = dbname.lower()
+    if lowered in _DISPOSABLE_DB_NAMES:
+        return True
+    return _TEST_SEGMENT in re.split(r"[_-]", lowered)
 
 
 @pytest.fixture
