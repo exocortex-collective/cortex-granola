@@ -93,9 +93,10 @@ def test_a_job_with_no_granola_id_fails_rather_than_retrying_forever(
     stats = worker.run_once()
 
     assert stats.failed == 1
-    status, attempts = _job_status(clean)[0]
-    assert attempts == 1
-    assert status in {"pending", "failed"}
+    # Pinned exactly: max_attempts is 3, so one failure leaves the job pending
+    # with a spent attempt. `status in {"pending", "failed"}` accepted either
+    # and so could not catch a change in retry policy.
+    assert _job_status(clean)[0] == ("pending", 1)
 
 
 @pytest.mark.live
@@ -182,3 +183,32 @@ def test_stopping_ends_the_batch_early(
     stats = worker.run_once()
 
     assert stats.parsed == 0, "a worker asked to stop takes no new work from the batch"
+    assert stats.released == 3, "and hands back what it claimed"
+
+    # The assertion this test was written for and did not make: rows left in
+    # 'processing' sit there until the visibility timeout -- up to 30 minutes --
+    # which defeats the point of a fast shutdown.
+    with clean.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM queue WHERE queue_name = %s AND status = 'processing'",
+            (PARSE_QUEUE,),
+        )
+        assert cur.fetchone()[0] == 0, "no job may be left claimed by a stopped worker"
+        cur.execute(
+            "SELECT count(*) FROM queue WHERE queue_name = %s AND status = 'pending' "
+            "AND attempts = 0",
+            (PARSE_QUEUE,),
+        )
+        assert cur.fetchone()[0] == 3, "released work is not charged an attempt"
+
+
+@pytest.mark.live
+def test_ensure_schema_is_reachable_from_the_worker(
+    worker: ParseWorker, clean: psycopg2.extensions.connection
+) -> None:
+    """The method the container runs at boot, exercised through the class that
+    runs it rather than through a parallel fixture path."""
+    worker.ensure_schema()
+    with clean.cursor() as cur:
+        cur.execute("SELECT to_regclass('granola_notes_raw')")
+        assert cur.fetchone()[0] is not None

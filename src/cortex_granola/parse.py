@@ -21,7 +21,7 @@ import structlog
 from psycopg2 import sql
 from psycopg2.extras import Json, execute_values
 
-from cortex_granola.granola.render import note_date
+from cortex_granola.granola.render import _parse_ts
 
 log = structlog.get_logger(__name__)
 
@@ -111,7 +111,7 @@ def _clear_derived(conn: psycopg2.extensions.connection, granola_id: str) -> Non
 def _write_note(conn: psycopg2.extensions.connection, granola_id: str, raw: dict[str, Any]) -> None:
     event = raw.get("calendar_event") or {}
     owner = raw.get("owner") or {}
-    when = note_date(raw)
+    when = _meeting_date(raw)
     transcript = raw.get("transcript") or []
 
     with conn.cursor() as cur:
@@ -134,10 +134,9 @@ def _write_note(conn: psycopg2.extensions.connection, granola_id: str, raw: dict
                 "web_url": raw.get("web_url"),
                 "start": event.get("scheduled_start_time"),
                 "end": event.get("scheduled_end_time"),
-                # The date the export worker files this note under. Derived from
-                # the same precedence render.py uses, so a note cannot be filed
-                # under one date in Postgres and another on disk.
-                "date": when.date(),
+                # The date the export worker files this note under, or NULL --
+                # see _meeting_date.
+                "date": when,
                 "created": raw.get("created_at"),
                 "updated": raw.get("updated_at"),
                 "summary_md": raw.get("summary_markdown"),
@@ -146,6 +145,27 @@ def _write_note(conn: psycopg2.extensions.connection, granola_id: str, raw: dict
                 "has_transcript": bool(transcript),
             },
         )
+
+
+def _meeting_date(raw: dict[str, Any]) -> dt.date | None:
+    """The meeting's date, or None when the note carries no usable timestamp.
+
+    render.py's note_date() falls back to datetime.now(UTC) so it always has
+    something to build a filename from. That fallback must not reach this
+    column. meeting_date is what the export worker files the note under, so a
+    re-parse of a timestamp-less note on a different day would silently move it
+    on disk -- and the value would be a client clock landing in a DATE column,
+    which is the clock-discipline failure this repo has a charter about.
+
+    NULL says "unknown", which is true and stable. The export worker decides
+    what to do with an undated note; it is not this function's guess to make.
+    """
+    event = raw.get("calendar_event") or {}
+    for value in (event.get("scheduled_start_time"), raw.get("created_at")):
+        parsed = _parse_ts(value)
+        if parsed:
+            return parsed.date()
+    return None
 
 
 def _write_transcript(
@@ -243,7 +263,6 @@ def _write_folders(
                 VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT (folder_id) DO UPDATE
                    SET name = EXCLUDED.name,
-                       parent_id = EXCLUDED.parent_id,
                        space_id = EXCLUDED.space_id,
                        space_name = EXCLUDED.space_name,
                        updated_at = NOW()
@@ -251,9 +270,16 @@ def _write_folders(
                 (
                     folder_id,
                     folder.get("name"),
-                    # parent_id references granola_folders; a parent we have not
-                    # seen yet would violate the FK, and the deny-list walk
-                    # rebuilds the tree from the API anyway.
+                    # NULL, and deliberately absent from the DO UPDATE above so
+                    # a re-parse cannot clobber a value someone else set.
+                    #
+                    # A note's folder_membership carries no parent: only
+                    # /v1/folders does, and nothing writes this table from that
+                    # endpoint yet. The earlier comment here claimed "the
+                    # deny-list walk rebuilds the tree from the API anyway" --
+                    # it does not. folders.py reads the tree into memory for
+                    # deny resolution and never persists it, so the hierarchy is
+                    # simply not populated. Tracked as Cortex-b4o.12.
                     None,
                     space_id,
                     spaces.get(space_id),

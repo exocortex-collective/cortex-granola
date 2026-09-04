@@ -229,3 +229,50 @@ def test_a_note_with_no_transcript_is_marked_as_such(
     with clean.cursor() as cur:
         cur.execute("SELECT has_transcript FROM granola_notes WHERE granola_id = %s", (NOTE,))
         assert cur.fetchone()[0] is False
+
+
+@pytest.mark.live
+def test_a_note_with_no_usable_timestamp_gets_a_null_meeting_date(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """render.py's note_date() falls back to now() so it always has a filename
+    to build. That fallback must not reach meeting_date: a re-parse on a
+    different day would silently refile the note on disk, and the value would be
+    a client clock landing in a DATE column.
+    """
+    raw = _raw(calendar_event={}, created_at=None)
+    _store(clean, {**raw, "updated_at": "2026-09-01T10:00:00Z"})
+    parse_note(clean, NOTE)
+    clean.commit()
+
+    with clean.cursor() as cur:
+        cur.execute("SELECT meeting_date FROM granola_notes WHERE granola_id = %s", (NOTE,))
+        assert cur.fetchone()[0] is None, "unknown is true and stable; today is neither"
+
+
+@pytest.mark.live
+def test_reparsing_does_not_clobber_a_folder_parent(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """parse.py is the only writer of granola_folders, and its ON CONFLICT used
+    to reset parent_id to NULL on every re-parse -- so a hierarchy written by
+    anything else would be destroyed rather than merely absent.
+    """
+    _store(clean, _raw())
+    parse_note(clean, NOTE)
+    clean.commit()
+
+    with clean.cursor() as cur:
+        cur.execute(
+            "INSERT INTO granola_folders (folder_id, name) VALUES ('fol_parent', 'Parent') "
+            "ON CONFLICT DO NOTHING"
+        )
+        cur.execute("UPDATE granola_folders SET parent_id = 'fol_parent' WHERE folder_id = 'fol_1'")
+    clean.commit()
+
+    parse_note(clean, NOTE)
+    clean.commit()
+
+    with clean.cursor() as cur:
+        cur.execute("SELECT parent_id FROM granola_folders WHERE folder_id = 'fol_1'")
+        assert cur.fetchone()[0] == "fol_parent"

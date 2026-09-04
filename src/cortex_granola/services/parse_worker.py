@@ -22,7 +22,14 @@ from typing import Any
 
 import psycopg2
 import structlog
-from cortex_utils.queue import claim, complete, ensure_queue_schema, fail_or_retry, worker_identity
+from cortex_utils.queue import (
+    claim,
+    complete,
+    ensure_queue_schema,
+    fail_or_retry,
+    release,
+    worker_identity,
+)
 
 from cortex_granola.config import GranolaSyncConfig, schema_sql
 from cortex_granola.ingest import PARSE_QUEUE
@@ -39,6 +46,7 @@ class WorkerStats:
     parsed: int = 0
     tombstoned: int = 0
     failed: int = 0
+    released: int = 0
 
 
 class ParseWorker:
@@ -96,11 +104,29 @@ class ParseWorker:
         stats = WorkerStats()
         with self._conn() as conn:
             jobs = claim(conn, PARSE_QUEUE, self.worker, limit=self.batch_size)
-            for job in jobs:
+            for index, job in enumerate(jobs):
                 if self._stop.is_set():
+                    # Hand back what we claimed and will not do. Simply breaking
+                    # left these rows in 'processing' until the visibility
+                    # timeout expired -- up to 30 minutes of nothing happening,
+                    # which defeats the fast shutdown the Event exists for.
+                    # release() does not consume an attempt: the work never
+                    # started, so charging it for our shutdown would be wrong.
+                    self._release_unclaimed(conn, jobs[index:], stats)
                     break
                 self._process(conn, job, stats)
         return stats
+
+    def _release_unclaimed(
+        self,
+        conn: psycopg2.extensions.connection,
+        jobs: list[dict[str, Any]],
+        stats: WorkerStats,
+    ) -> None:
+        for job in jobs:
+            if release(conn, job["id"], 0, self.worker):
+                stats.released += 1
+        log.info("granola parse: released unstarted jobs", count=stats.released)
 
     def _process(
         self, conn: psycopg2.extensions.connection, job: dict[str, Any], stats: WorkerStats
@@ -110,8 +136,7 @@ class ParseWorker:
         if not granola_id:
             # A job with no id can never succeed, so retrying it burns attempts
             # to reach the same conclusion. Fail it once, with the reason.
-            fail_or_retry(conn, job_id, "payload has no granola_id", self.worker)
-            stats.failed += 1
+            self._fail(conn, job_id, "payload has no granola_id", stats)
             return
 
         try:
@@ -123,8 +148,7 @@ class ParseWorker:
             # gone for good.
             conn.rollback()
             log.error("granola parse: raw row missing", granola_id=granola_id, job_id=job_id)
-            fail_or_retry(conn, job_id, f"raw row missing for {granola_id}", self.worker)
-            stats.failed += 1
+            self._fail(conn, job_id, f"raw row missing for {granola_id}", stats)
             return
         except Exception as exc:
             conn.rollback()
@@ -135,8 +159,7 @@ class ParseWorker:
                 error=str(exc),
                 exc_info=True,
             )
-            fail_or_retry(conn, job_id, str(exc), self.worker)
-            stats.failed += 1
+            self._fail(conn, job_id, str(exc), stats)
             return
 
         # complete(commit=False) so the derived rows and the completion land in
@@ -156,6 +179,22 @@ class ParseWorker:
             stats.tombstoned += 1
         else:
             stats.parsed += 1
+
+    def _fail(
+        self, conn: psycopg2.extensions.connection, job_id: int, reason: str, stats: WorkerStats
+    ) -> None:
+        """Report a failure, counting what actually happened.
+
+        fail_or_retry returns which of three things it did, and counting a
+        'stale' -- the claim was already lost to someone else -- as our failure
+        would attribute another worker's row to this one. The database said what
+        it did; reading the answer costs nothing.
+        """
+        outcome = fail_or_retry(conn, job_id, reason, self.worker)
+        if outcome == "stale":
+            log.warning("granola parse: lost the claim before failing", job_id=job_id)
+            return
+        stats.failed += 1
 
     def run(self) -> None:
         self.ensure_schema()
