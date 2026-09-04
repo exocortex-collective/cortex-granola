@@ -1,0 +1,44 @@
+# Granola -> markdown sync configuration.
+#
+# Policy is DEFAULT ALLOW: every note the API key can see is synced unless it
+# lands in a folder or space named below. Granola's API has no concept of tags,
+# so folders (and the spaces that contain them) are the only grouping available.
+
+[sync]
+# Summaries and raw transcripts are written as discrete files, one pair per
+# meeting, mirrored across these two trees.
+notes_dir = "notes"
+transcripts_dir = "transcripts"
+state_file = ".granola-sync-state.json"
+
+# Write the transcripts_dir files. Transcripts are verbatim and often catch
+# off-topic chatter before and after the meeting proper - set false to sync
+# summaries only.
+include_transcript = true
+
+# The note owner's own private jottings. Only ever populated for notes created
+# by the key's owner; always null for workspace keys and shared notes.
+include_private_notes = false
+
+# Notes in no folder at all. True keeps them (consistent with default-allow);
+# false makes filing a note a precondition for syncing it.
+sync_unfiled_notes = true
+
+# Re-check this far back on each incremental run, so notes edited while a sync
+# was mid-flight are not skipped.
+overlap_minutes = 60
+
+# Limit the very first run to the last N days. Omit or null to backfill all.
+# initial_backfill_days = 365
+
+[exclude]
+# Folder names (case-insensitive) or fol_* IDs. Excluding a folder also
+# excludes every folder nested beneath it.
+folders = [
+  "Bus Dev",
+  "Rubric-writing",
+  "User interviews",
+]
+
+# Space names (case-insensitive) or spa_* IDs. Excludes every note in the space.
+spaces = []
