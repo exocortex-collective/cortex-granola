@@ -23,6 +23,57 @@ from importlib import resources
 from pathlib import Path
 
 
+def dsn_from_env() -> str:
+    """The Postgres DSN, without requiring anything Granola-specific.
+
+    Its own function because the parse worker needs a database and no
+    credential. Reaching for GranolaSyncConfig.from_env() there would have
+    forced an API key on a service that never calls the API, and the compose
+    file would then have mounted the secret into a container with no use for
+    it.
+    """
+    return (
+        f"host={os.environ.get('POSTGRES_HOST', 'localhost')} "
+        f"port={os.environ.get('POSTGRES_PORT', '5432')} "
+        f"dbname={os.environ.get('POSTGRES_DB', 'cortex')} "
+        f"user={os.environ.get('POSTGRES_USER', 'cortex')} "
+        f"password={os.environ.get('POSTGRES_PASSWORD', 'cortex')}"
+    )
+
+
+def _api_key() -> str:
+    """The Granola API key, from the environment or a mounted file.
+
+    GRANOLA_API_KEY_FILE is how the containers get it, matching the rest of the
+    family: ~/cortex-secrets is mounted read-only and the path is passed in,
+    the same shape as GMAIL_TOKEN_PATH. Putting the key itself in compose env
+    would put it in `docker inspect` output and in the shell history of anyone
+    who runs the command.
+
+    The env var still works, because tests and local runs want it.
+    """
+    key = os.environ.get("GRANOLA_API_KEY", "").strip()
+    if key:
+        return key
+
+    path = os.environ.get("GRANOLA_API_KEY_FILE", "").strip()
+    if path:
+        try:
+            key = Path(path).read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise ValueError(f"GRANOLA_API_KEY_FILE {path!r} is unreadable: {exc}") from exc
+        # A file holding KEY=value is the shape of an env file, and reading it
+        # whole would send "GRANOLA_API_KEY=grn_..." as the bearer token -- a
+        # 401 that looks like a bad key rather than a bad parse.
+        if "=" in key.split("\n")[0]:
+            key = key.split("\n")[0].partition("=")[2].strip()
+        if key:
+            return key
+        raise ValueError(f"GRANOLA_API_KEY_FILE {path!r} is empty")
+
+    raise ValueError("GRANOLA_API_KEY or GRANOLA_API_KEY_FILE is required")
+
+
 def schema_sql() -> str:
     """The DDL this service applies at boot, read as package data.
 
@@ -79,18 +130,9 @@ class GranolaSyncConfig:
 
     @classmethod
     def from_env(cls) -> GranolaSyncConfig:
-        api_key = os.environ.get("GRANOLA_API_KEY", "")
-        if not api_key:
-            raise ValueError("GRANOLA_API_KEY is required")
         return cls(
-            api_key=api_key,
-            dsn=(
-                f"host={os.environ.get('POSTGRES_HOST', 'localhost')} "
-                f"port={os.environ.get('POSTGRES_PORT', '5432')} "
-                f"dbname={os.environ.get('POSTGRES_DB', 'cortex')} "
-                f"user={os.environ.get('POSTGRES_USER', 'cortex')} "
-                f"password={os.environ.get('POSTGRES_PASSWORD', 'cortex')}"
-            ),
+            api_key=_api_key(),
+            dsn=dsn_from_env(),
             source=os.environ.get("GRANOLA_SOURCE", "default"),
             poll_interval_s=int(os.environ.get("GRANOLA_POLL_INTERVAL_S", "900")),
             overlap_minutes=int(os.environ.get("GRANOLA_OVERLAP_MINUTES", "60")),

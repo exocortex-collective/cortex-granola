@@ -12,6 +12,7 @@ forever.
 
 from __future__ import annotations
 
+import os
 import signal
 import threading
 from collections.abc import Iterator
@@ -22,6 +23,7 @@ from typing import Any
 
 import psycopg2
 import structlog
+from cortex_utils.metrics import start_metrics_server
 from cortex_utils.queue import (
     claim,
     complete,
@@ -31,7 +33,7 @@ from cortex_utils.queue import (
     worker_identity,
 )
 
-from cortex_granola.config import GranolaSyncConfig, schema_sql
+from cortex_granola.config import dsn_from_env, schema_sql
 from cortex_granola.ingest import PARSE_QUEUE
 from cortex_granola.parse import RawNoteMissingError, parse_note
 
@@ -52,11 +54,18 @@ class WorkerStats:
 class ParseWorker:
     def __init__(
         self,
-        config: GranolaSyncConfig,
+        dsn: str,
         batch_size: int = DEFAULT_BATCH,
         poll_interval_s: int = DEFAULT_POLL_INTERVAL_S,
     ) -> None:
-        self.config = config
+        """Takes a DSN, not a GranolaSyncConfig.
+
+        This worker reads raw rows out of Postgres and never talks to Granola.
+        Accepting a config that carries an API key would have made the compose
+        file mount the secret into a container with no use for it -- exposure
+        bought by nothing but a type signature.
+        """
+        self.dsn = dsn
         self.batch_size = batch_size
         self.poll_interval_s = poll_interval_s
         # Stable for the life of the process: a worker that regenerated its
@@ -84,7 +93,7 @@ class ParseWorker:
 
     @contextmanager
     def _conn(self) -> Iterator[psycopg2.extensions.connection]:
-        conn = psycopg2.connect(self.config.dsn)
+        conn = psycopg2.connect(self.dsn)
         try:
             yield conn
         finally:
@@ -226,7 +235,11 @@ class ParseWorker:
 
 
 def main() -> None:
-    ParseWorker(GranolaSyncConfig.from_env()).run()
+    # Serves the port compose maps. Without it the mapping is decorative, which
+    # is worse than absent: `docker compose ps` shows a port and nothing
+    # answers on it.
+    start_metrics_server(port=int(os.environ.get("METRICS_PORT", "8000")))
+    ParseWorker(dsn_from_env()).run()
 
 
 if __name__ == "__main__":

@@ -146,3 +146,69 @@ def test_schema_sql_is_readable_as_package_data() -> None:
     installed container has no repo to be relative to."""
     sql = schema_sql()
     assert "CREATE TABLE IF NOT EXISTS granola_notes_raw" in sql
+
+
+# --- secrets from a mounted file ------------------------------------------
+
+
+def test_the_api_key_can_come_from_a_mounted_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """How the container gets it: ~/cortex-secrets mounted read-only and the
+    path passed in, matching GMAIL_TOKEN_PATH. The key never enters compose,
+    so it never enters `docker inspect` output."""
+    keyfile = tmp_path / "granola.env"
+    keyfile.write_text("grn_from_file\n")
+    monkeypatch.setenv("GRANOLA_API_KEY_FILE", str(keyfile))
+    assert GranolaSyncConfig.from_env().api_key == "grn_from_file"
+
+
+def test_a_key_file_in_env_format_yields_the_value_not_the_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """~/cortex-secrets/granola.env holds GRANOLA_API_KEY=grn_...
+
+    Reading it whole would send the literal 'GRANOLA_API_KEY=grn_...' as the
+    bearer token -- a 401 that reads like a bad key rather than a bad parse.
+    """
+    keyfile = tmp_path / "granola.env"
+    keyfile.write_text("GRANOLA_API_KEY=grn_real_value\n")
+    monkeypatch.setenv("GRANOLA_API_KEY_FILE", str(keyfile))
+    assert GranolaSyncConfig.from_env().api_key == "grn_real_value"
+
+
+def test_the_env_var_wins_over_the_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    keyfile = tmp_path / "granola.env"
+    keyfile.write_text("grn_from_file\n")
+    monkeypatch.setenv("GRANOLA_API_KEY_FILE", str(keyfile))
+    monkeypatch.setenv("GRANOLA_API_KEY", "grn_from_env")
+    assert GranolaSyncConfig.from_env().api_key == "grn_from_env"
+
+
+def test_an_unreadable_key_file_is_a_clear_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A missing mount should say so, not surface later as an auth failure."""
+    monkeypatch.setenv("GRANOLA_API_KEY_FILE", str(tmp_path / "nope.env"))
+    with pytest.raises(ValueError, match="unreadable"):
+        GranolaSyncConfig.from_env()
+
+
+def test_an_empty_key_file_is_rejected(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    keyfile = tmp_path / "granola.env"
+    keyfile.write_text("\n")
+    monkeypatch.setenv("GRANOLA_API_KEY_FILE", str(keyfile))
+    with pytest.raises(ValueError, match="empty"):
+        GranolaSyncConfig.from_env()
+
+
+def test_neither_source_is_a_clear_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    with pytest.raises(ValueError, match="GRANOLA_API_KEY_FILE"):
+        GranolaSyncConfig.from_env()
+
+
+def test_dsn_from_env_needs_no_credential() -> None:
+    """The parse worker asks for this and nothing else."""
+    from cortex_granola.config import dsn_from_env
+
+    assert "dbname=" in dsn_from_env()
