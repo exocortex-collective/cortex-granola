@@ -84,8 +84,11 @@ def test_a_path_escaping_the_root_is_refused(tmp_path: Path, escape: str) -> Non
 
 
 def test_a_legitimate_nested_path_is_allowed(tmp_path: Path) -> None:
-    target = safe_target(tmp_path / "notes", "2026/2026-09-01-x-not_1.md")
-    assert target.parent.name == "2026"
+    """Asserts the whole resolved path, not just the parent's name -- the
+    latter passes under a subtly wrong safe_target."""
+    root = tmp_path / "notes"
+    target = safe_target(root, "2026/2026-09-01-x-not_1.md")
+    assert target == root.resolve() / "2026" / "2026-09-01-x-not_1.md"
 
 
 # --- writing --------------------------------------------------------------
@@ -487,3 +490,70 @@ def _umask() -> int:
     current = os.umask(0)
     os.umask(current)
     return current
+
+
+# --- the worker's error paths ---------------------------------------------
+
+
+@pytest.mark.live
+def test_an_ordinary_failure_is_counted_and_the_batch_continues(
+    clean: psycopg2.extensions.connection,
+    config: ExportConfig,
+    dsn: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cortex_granola.parse import parse_note
+    from cortex_granola.services import export_worker as ew
+
+    _store(clean, _raw())
+    parse_note(clean, NOTE)
+    clean.commit()
+
+    def boom(*args: Any, **kwargs: Any) -> str:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(ew, "export_note", boom)
+    stats = ew.ExportWorker(dsn, config).run_once()
+
+    assert stats.errors == 1, "a transient failure is counted, not fatal"
+
+
+@pytest.mark.live
+def test_a_refused_path_stops_the_worker_instead_of_retrying_forever(
+    clean: psycopg2.extensions.connection,
+    config: ExportConfig,
+    dsn: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ExportPathError means something in the vault tried to send a write or a
+    delete somewhere this worker had no business going. Counting it as a
+    routine error retried it every poll forever, at the same severity as a
+    flaky disk -- so the one log line that mattered scrolled past.
+    """
+    from cortex_granola.export import ExportPathError
+    from cortex_granola.parse import parse_note
+    from cortex_granola.services import export_worker as ew
+
+    _store(clean, _raw())
+    parse_note(clean, NOTE)
+    clean.commit()
+
+    def refuse(*args: Any, **kwargs: Any) -> str:
+        raise ExportPathError("/etc/passwd is outside the export root")
+
+    monkeypatch.setattr(ew, "export_note", refuse)
+    worker = ew.ExportWorker(dsn, config)
+
+    with pytest.raises(ExportPathError):
+        worker.run_once()
+
+
+def test_migrations_are_discovered_not_listed() -> None:
+    """A hand-maintained tuple meant a new migration file could be added and
+    silently never applied: no error, no failing test, just a column that is
+    not there at runtime."""
+    from cortex_granola.config import schema_sql
+
+    sql = schema_sql()
+    assert "granola_notes_raw" in sql, "001 applied"
+    assert "granola_exported_files" in sql, "002 applied"

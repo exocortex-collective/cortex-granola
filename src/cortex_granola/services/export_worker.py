@@ -24,7 +24,7 @@ import structlog
 from cortex_utils.metrics import start_metrics_server
 
 from cortex_granola.config import ExportConfig, dsn_from_env, schema_sql
-from cortex_granola.export import ExportStats, export_note
+from cortex_granola.export import ExportPathError, ExportStats, export_note
 
 log = structlog.get_logger(__name__)
 
@@ -112,6 +112,15 @@ class ExportWorker:
         try:
             outcome = export_note(conn, self.config, granola_id)
             conn.commit()
+        except ExportPathError:
+            # Deliberately NOT caught with the rest. This means something in
+            # the vault tried to send a write or a delete somewhere this worker
+            # had no business going -- a symlink, or a title that escaped the
+            # slug. Counting it as a routine error would retry it every poll
+            # forever, at the same severity as a flaky disk, and the log line
+            # saying so would scroll past.
+            conn.rollback()
+            raise
         except Exception as exc:
             conn.rollback()
             stats.errors += 1
@@ -137,6 +146,19 @@ class ExportWorker:
         while not self._stop.is_set():
             try:
                 stats = self.run_once()
+            except ExportPathError:
+                # Stop, rather than crash-loop or retry. Restarting would hit
+                # the same path next poll, and a container flapping on
+                # restart: unless-stopped hides the reason. Stopping cleanly
+                # leaves the process up, metrics still served, and one CRITICAL
+                # line saying exactly which path it refused.
+                log.critical(
+                    "granola export refused a path and stopped; "
+                    "the vault holds something this worker will not touch",
+                    exc_info=True,
+                )
+                self._stop.set()
+                break
             except Exception:
                 log.error("granola export worker crashed", exc_info=True)
                 self._stop.wait(self.poll_interval_s)
