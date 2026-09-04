@@ -99,23 +99,37 @@ def write_atomically(target: Path, content: str) -> None:
     Obsidian vault is worse than no note: it syncs, and it looks real.
     """
     target.parent.mkdir(parents=True, exist_ok=True)
+    # Whatever the user set on an existing file wins. The first version of this
+    # chmod fixed mkstemp silently NARROWING every export to 0600 and then
+    # silently WIDENED instead: a note deliberately locked to 0600 came back
+    # 0644 on the next re-export, and this worker re-exports whenever
+    # fetched_at moves. Both directions are the same mistake -- deciding a
+    # file's permissions on the user's behalf without being asked.
+    existing_mode: int | None = None
+    if target.is_file() and not target.is_symlink():
+        existing_mode = target.stat().st_mode & 0o777
+
     fd, tmp_name = tempfile.mkstemp(dir=target.parent, prefix=".granola-", suffix=".tmp")
     tmp = Path(tmp_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(content)
         # mkstemp always creates 0600 and rename does not adopt the replaced
-        # file's mode, so without this every export -- including a re-export of
-        # an existing note -- silently narrowed it to owner-only. A vault read
-        # by sync or backup tooling notices; the user does not, until it stops
-        # working.
-        umask = os.umask(0)
-        os.umask(umask)
-        tmp.chmod(0o666 & ~umask)
+        # file's mode, so a new file needs the umask default applied explicitly
+        # or a vault read by sync or backup tooling cannot see it. An existing
+        # file keeps exactly what it had.
+        tmp.chmod(existing_mode if existing_mode is not None else _default_mode())
         tmp.replace(target)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
+
+
+def _default_mode() -> int:
+    """The mode a newly created file should have, per the process umask."""
+    umask = os.umask(0)
+    os.umask(umask)
+    return 0o666 & ~umask
 
 
 def remove_recorded(root: Path, relative: str) -> bool:

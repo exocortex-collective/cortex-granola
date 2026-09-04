@@ -473,15 +473,25 @@ def test_an_exported_file_is_readable_by_more_than_its_owner(tmp_path: Path) -> 
     assert mode & 0o044, f"mode {mode:o} is not readable beyond the owner"
 
 
-def test_a_re_export_does_not_narrow_an_existing_file(tmp_path: Path) -> None:
+@pytest.mark.parametrize("mode", [0o600, 0o640, 0o664])
+def test_a_re_export_preserves_whatever_mode_the_file_had(tmp_path: Path, mode: int) -> None:
+    """Both directions matter, and the first fix only handled one.
+
+    0o600 is the case that exposes it: a user who deliberately locked a
+    sensitive note down had it silently reopened to the umask default on the
+    next re-export, and this worker re-exports whenever fetched_at moves. The
+    old test used 0o644, which is indistinguishable from that default and so
+    could not tell narrowing from widening.
+    """
     target = tmp_path / "notes" / "a.md"
     target.parent.mkdir(parents=True)
     target.write_text("first")
-    target.chmod(0o644)
+    target.chmod(mode)
 
     write_atomically(target, "second")
 
-    assert target.stat().st_mode & 0o777 == 0o644 & ~_umask()
+    assert target.stat().st_mode & 0o777 == mode
+    assert target.read_text() == "second"
 
 
 def _umask() -> int:
@@ -548,12 +558,34 @@ def test_a_refused_path_stops_the_worker_instead_of_retrying_forever(
         worker.run_once()
 
 
-def test_migrations_are_discovered_not_listed() -> None:
+def test_every_migration_file_on_disk_reaches_the_database() -> None:
     """A hand-maintained tuple meant a new migration file could be added and
     silently never applied: no error, no failing test, just a column that is
-    not there at runtime."""
+    not there at runtime.
+
+    Asserting "001 and 002 are present" did not pin that -- both were in the
+    old tuple too, so the test passed either way. Comparing against the
+    DIRECTORY is what makes it a regression test: add a file, and it must
+    appear without anyone editing a list.
+    """
+    from importlib import resources
+
     from cortex_granola.config import schema_sql
 
+    on_disk = sorted(
+        entry.name
+        for entry in resources.files("cortex_granola.migrations").iterdir()
+        if entry.name.endswith(".sql")
+    )
+    assert on_disk, "there are migrations to find"
+
     sql = schema_sql()
-    assert "granola_notes_raw" in sql, "001 applied"
-    assert "granola_exported_files" in sql, "002 applied"
+    for name in on_disk:
+        first_statement = (
+            resources.files("cortex_granola.migrations")
+            .joinpath(name)
+            .read_text(encoding="utf-8")
+            .split(";")[0]
+            .strip()
+        )
+        assert first_statement in sql, f"{name} was not applied"
