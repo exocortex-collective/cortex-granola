@@ -211,3 +211,61 @@ def test_ensure_schema_is_reachable_from_the_worker(
     with clean.cursor() as cur:
         cur.execute("SELECT to_regclass('granola_notes_raw')")
         assert cur.fetchone()[0] is not None
+
+
+@pytest.mark.live
+def test_concurrent_schema_application_does_not_race(dsn: str) -> None:
+    """Cortex-b4o.13: all three services apply migrations on boot, and CREATE
+    TABLE IF NOT EXISTS is NOT safe against a concurrent identical CREATE --
+    they collide in pg_type and one dies with a UniqueViolation. restart:
+    unless-stopped recovered it, which is worse than the crash, because a
+    container flapping on boot reads as "Up" and hides why.
+
+    Creates its OWN database. The first version used the shared test DSN and so
+    passed with the lock removed: every earlier test in the file had already
+    primed those tables through the schema fixture, leaving nothing to race by
+    the time this ran. It failed in isolation and passed in CI -- which is the
+    worst of both, because CI is where a re-removal of the lock would need
+    catching.
+    """
+    import threading
+
+    from cortex_granola.config import apply_schema
+
+    scratch = "cortex_race_scratch"
+    admin = psycopg2.connect(_swap_dbname(dsn, "postgres"))
+    admin.autocommit = True
+    try:
+        with admin.cursor() as cur:
+            cur.execute(f"DROP DATABASE IF EXISTS {scratch}")
+            cur.execute(f"CREATE DATABASE {scratch}")
+
+        errors: list[Exception] = []
+        barrier = threading.Barrier(4)
+
+        def apply() -> None:
+            conn = psycopg2.connect(_swap_dbname(dsn, scratch))
+            try:
+                barrier.wait(timeout=15)  # maximise the overlap
+                apply_schema(conn)
+            except Exception as exc:  # noqa: BLE001 - collected and asserted below
+                errors.append(exc)
+            finally:
+                conn.close()
+
+        threads = [threading.Thread(target=apply) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+
+        assert errors == [], f"concurrent schema application raced: {errors}"
+    finally:
+        with admin.cursor() as cur:
+            cur.execute(f"DROP DATABASE IF EXISTS {scratch}")
+        admin.close()
+
+
+def _swap_dbname(dsn: str, dbname: str) -> str:
+    parts = [p for p in dsn.split() if not p.startswith("dbname=")]
+    return " ".join([*parts, f"dbname={dbname}"])

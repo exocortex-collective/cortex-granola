@@ -20,7 +20,7 @@ import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import psycopg2
@@ -28,7 +28,7 @@ import structlog
 from cortex_utils.metrics import start_metrics_server
 from cortex_utils.queue import ensure_queue_schema
 
-from cortex_granola.config import GranolaSyncConfig, schema_sql
+from cortex_granola.config import GranolaSyncConfig, apply_schema
 from cortex_granola.granola.api import GranolaClient
 from cortex_granola.granola.folders import collect_denied_note_ids, resolve_deny_list
 from cortex_granola.ingest import Outcome, ingest_one, tombstone
@@ -55,6 +55,30 @@ class PollStats:
     def clean(self) -> bool:
         """A run with no errors. The watermark moves only on this."""
         return self.errors == 0
+
+
+def _rfc3339(when: datetime) -> str:
+    """Format an instant the way the Granola API accepts it.
+
+    NOT datetime.isoformat(). That produces microseconds and a "+00:00" offset:
+
+        2026-09-04T19:33:35.250175+00:00
+
+    which the API rejects with VALIDATION_ERROR / "Invalid date". Every
+    incremental poll failed on it while the first full scan succeeded, because
+    a full scan passes updated_after=None and never formats anything -- so the
+    backfill looked like proof the poller worked.
+
+    Nothing in the test suite could have caught it either: the fake client
+    accepts any string. Only a real API rejects this one.
+    """
+    if when.tzinfo is None:
+        # astimezone() on a naive datetime silently assumes LOCAL time, which
+        # would shift the window by the machine's offset and skip notes. It is
+        # tz-aware today because last_synced_at is a TIMESTAMPTZ, but that is
+        # an invariant somewhere else, so say so here rather than inherit it.
+        raise ValueError(f"refusing to format a naive datetime as UTC: {when!r}")
+    return when.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class GranolaSync:
@@ -85,8 +109,7 @@ class GranolaSync:
         """
         with self._conn() as conn:
             ensure_queue_schema(conn)
-            with conn.cursor() as cur:
-                cur.execute(schema_sql())
+            apply_schema(conn)
             self._seed_sync_state(conn)
             conn.commit()
 
@@ -138,7 +161,7 @@ class GranolaSync:
             return None
         last_synced_at, overlap_minutes = row
         window_start: datetime = last_synced_at - timedelta(minutes=overlap_minutes)
-        return window_start.isoformat()
+        return _rfc3339(window_start)
 
     def _record_poll(
         self, conn: psycopg2.extensions.connection, scan_started: datetime, stats: PollStats

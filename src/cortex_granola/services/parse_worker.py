@@ -33,7 +33,7 @@ from cortex_utils.queue import (
     worker_identity,
 )
 
-from cortex_granola.config import dsn_from_env, schema_sql
+from cortex_granola.config import apply_schema, dsn_from_env
 from cortex_granola.ingest import PARSE_QUEUE
 from cortex_granola.parse import RawNoteMissingError, parse_note
 
@@ -102,9 +102,7 @@ class ParseWorker:
     def ensure_schema(self) -> None:
         with self._conn() as conn:
             ensure_queue_schema(conn)
-            with conn.cursor() as cur:
-                cur.execute(schema_sql())
-            conn.commit()
+            apply_schema(conn)
 
     # -- work --------------------------------------------------------------
 

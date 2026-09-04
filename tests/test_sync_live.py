@@ -9,6 +9,7 @@ else.
 
 from __future__ import annotations
 
+import re
 from datetime import timedelta
 from typing import Any
 
@@ -30,8 +31,22 @@ class FakeClient:
         self.updated_after_seen: list[str | None] = []
         self.note_updated_at = "2026-09-01T10:00:00Z"
 
+    # The real API rejects anything that is not RFC3339 seconds-precision UTC.
+    # The first version of this fake accepted any string, which is why every
+    # incremental poll failed in production against a suite that was green:
+    # datetime.isoformat() produces "2026-09-04T19:33:35.250175+00:00" and the
+    # API answers VALIDATION_ERROR / "Invalid date". A fake looser than the
+    # service it stands in for tests the fake.
+    _RFC3339 = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
     def list_notes(self, **kwargs: Any) -> list[dict[str, Any]]:
-        self.updated_after_seen.append(kwargs.get("updated_after"))
+        since = kwargs.get("updated_after")
+        if since is not None and not self._RFC3339.match(since):
+            raise AssertionError(
+                f"granola rejects updated_after={since!r}: "
+                "it must be RFC3339 UTC to the second, e.g. 2026-09-04T19:33:35Z"
+            )
+        self.updated_after_seen.append(since)
         return self.notes
 
     def list_folders(self) -> list[dict[str, Any]]:
@@ -428,3 +443,27 @@ def test_run_once_survives_a_crash_without_advancing(
     sync.client = Exploding([])
     assert sync.run_once() is None, "a crashed pass reports None rather than raising"
     assert _watermark(clean)[0] is None
+
+
+@pytest.mark.live
+def test_the_incremental_window_is_sent_as_rfc3339(
+    sync: GranolaSync, clean: psycopg2.extensions.connection
+) -> None:
+    """The bug this pins broke every incremental poll in production while the
+    suite stayed green.
+
+    datetime.isoformat() gives '2026-09-04T19:33:35.250175+00:00'; the API
+    answers VALIDATION_ERROR / 'Invalid date'. The first full scan succeeded
+    because it passes updated_after=None and never formats anything -- so the
+    backfill working looked like proof the poller worked.
+    """
+    client = FakeClient([_note("not_a")])
+    sync.client = client
+
+    sync.poll()  # first pass: no watermark, so no updated_after
+    assert client.updated_after_seen == [None]
+
+    sync.poll()  # second pass sends the window; FakeClient now rejects bad formats
+    since = client.updated_after_seen[-1]
+    assert since is not None
+    assert since.endswith("Z") and "." not in since, since
