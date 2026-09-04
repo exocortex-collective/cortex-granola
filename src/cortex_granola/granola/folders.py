@@ -7,7 +7,7 @@ them. Excluding a folder therefore has to exclude its whole subtree.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -41,7 +41,7 @@ class DenyResolution:
 
 
 def _index(
-    folders: list[Mapping[str, Any]],
+    folders: Sequence[Mapping[str, Any]],
 ) -> tuple[dict[str, Mapping[str, Any]], dict[str | None, list[str]]]:
     """Folder-by-id, and parent-id to child-ids."""
     by_id = {f["id"]: f for f in folders}
@@ -52,7 +52,7 @@ def _index(
 
 
 def _match_folder_terms(
-    folders: list[Mapping[str, Any]],
+    folders: Sequence[Mapping[str, Any]],
     by_id: dict[str, Mapping[str, Any]],
     terms: list[str],
 ) -> tuple[set[str], list[str], list[str]]:
@@ -78,7 +78,7 @@ def _match_folder_terms(
 
 
 def _match_space_terms(
-    folders: list[Mapping[str, Any]], terms: list[str]
+    folders: Sequence[Mapping[str, Any]], terms: list[str]
 ) -> tuple[set[str], list[str], list[str]]:
     """Resolve space names or spa_* ids to space ids.
 
@@ -148,7 +148,7 @@ def _expand(seeds: set[str], children: dict[str | None, list[str]]) -> set[str]:
 
 
 def resolve_deny_list(
-    folders: list[Mapping[str, Any]], deny_folders: list[str], deny_spaces: list[str]
+    folders: Sequence[Mapping[str, Any]], deny_folders: list[str], deny_spaces: list[str]
 ) -> DenyResolution:
     """Turn deny-list terms into the set of folder ids whose notes are excluded.
 
