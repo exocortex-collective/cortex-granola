@@ -212,3 +212,47 @@ def test_dsn_from_env_needs_no_credential() -> None:
     from cortex_granola.config import dsn_from_env
 
     assert "dbname=" in dsn_from_env()
+
+
+@pytest.mark.parametrize(
+    "content,expected",
+    [
+        ("grn_plain\n", "grn_plain"),
+        ("GRANOLA_API_KEY=grn_assigned\n", "grn_assigned"),
+        ("export GRANOLA_API_KEY=grn_exported\n", "grn_exported"),
+        ('GRANOLA_API_KEY="grn_quoted"\n', "grn_quoted"),
+        # Regression: a bare key containing "=" was truncated to what followed
+        # the first "=", silently, because the parser sniffed for "=" instead of
+        # looking for an assignment.
+        ("grn_abc=123XYZ==\n", "grn_abc=123XYZ=="),
+        # Regression: a leading comment meant the sniff never matched, so the
+        # WHOLE multi-line blob was returned and sent as the bearer token.
+        ("# cortex secrets\n\nGRANOLA_API_KEY=grn_after_comment\n", "grn_after_comment"),
+        ("\n\nGRANOLA_API_KEY=grn_after_blank\n", "grn_after_blank"),
+    ],
+)
+def test_key_file_shapes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, content: str, expected: str
+) -> None:
+    keyfile = tmp_path / "granola.env"
+    keyfile.write_text(content)
+    monkeypatch.setenv("GRANOLA_API_KEY_FILE", str(keyfile))
+    assert GranolaSyncConfig.from_env().api_key == expected
+
+
+def test_an_ambiguous_key_file_is_refused(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Several lines and no assignment: guessing which one is the key is how
+    the first version shipped a bug. Say so instead."""
+    keyfile = tmp_path / "granola.env"
+    keyfile.write_text("grn_one\ngrn_two\n")
+    monkeypatch.setenv("GRANOLA_API_KEY_FILE", str(keyfile))
+    with pytest.raises(ValueError, match="cannot tell which line"):
+        GranolaSyncConfig.from_env()
+
+
+def test_a_comments_only_key_file_is_empty(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    keyfile = tmp_path / "granola.env"
+    keyfile.write_text("# nothing here\n\n")
+    monkeypatch.setenv("GRANOLA_API_KEY_FILE", str(keyfile))
+    with pytest.raises(ValueError, match="empty"):
+        GranolaSyncConfig.from_env()

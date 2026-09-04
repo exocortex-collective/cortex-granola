@@ -20,8 +20,11 @@ RUN uv sync --frozen --no-dev
 RUN chown -R appuser:appuser /app
 USER appuser
 
-# Secrets are mounted read-only at runtime; nothing is baked into the image.
-VOLUME /app/secrets
+# No VOLUME for secrets. Both services share this image, and only granola-sync
+# has a compose bind mount at /app/secrets -- so a VOLUME here made Docker
+# create an anonymous, root-owned volume in the parse worker instead, leaking a
+# fresh one on every recreate (`docker compose down` does not remove anonymous
+# volumes without -v). Compose declares the real mount where it is needed.
 
 # Overridden per service in docker-compose. The poller is the default because
 # it is the one that must always be running.
