@@ -98,8 +98,19 @@ def _read_key_file(path: Path) -> str:
 
     for line in meaningful:
         match = _ASSIGNMENT.match(line)
-        if match:
-            return match.group(1).strip().strip('"').strip("'")
+        if not match:
+            continue
+        value = match.group(1).strip().strip('"').strip("'")
+        if not value:
+            # An assignment with nothing after the "=" is a misconfiguration,
+            # not a key. Returning "" here booted the container successfully
+            # with an empty bearer token and failed later as an opaque 401 --
+            # the same "plausible-looking wrong value instead of an error" this
+            # function was rewritten to stop doing.
+            raise ValueError(
+                f"GRANOLA_API_KEY_FILE {str(path)!r} assigns GRANOLA_API_KEY an empty value"
+            )
+        return value
 
     if not meaningful:
         raise ValueError(f"GRANOLA_API_KEY_FILE {str(path)!r} is empty")

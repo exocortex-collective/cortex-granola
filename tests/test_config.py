@@ -256,3 +256,46 @@ def test_a_comments_only_key_file_is_empty(monkeypatch: pytest.MonkeyPatch, tmp_
     monkeypatch.setenv("GRANOLA_API_KEY_FILE", str(keyfile))
     with pytest.raises(ValueError, match="empty"):
         GranolaSyncConfig.from_env()
+
+
+def test_an_assignment_with_no_value_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regression: `GRANOLA_API_KEY=` matched the assignment and returned "",
+    so the container booted with an empty bearer token and failed later as an
+    opaque 401 -- the same shape as the bug this parser replaced."""
+    keyfile = tmp_path / "granola.env"
+    keyfile.write_text("GRANOLA_API_KEY=\n")
+    monkeypatch.setenv("GRANOLA_API_KEY_FILE", str(keyfile))
+    with pytest.raises(ValueError, match="empty value"):
+        GranolaSyncConfig.from_env()
+
+
+@pytest.mark.parametrize(
+    "content", ['GRANOLA_API_KEY=""\n', "GRANOLA_API_KEY=''\n", "GRANOLA_API_KEY=   \n"]
+)
+def test_a_quoted_or_padded_empty_value_is_also_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, content: str
+) -> None:
+    keyfile = tmp_path / "granola.env"
+    keyfile.write_text(content)
+    monkeypatch.setenv("GRANOLA_API_KEY_FILE", str(keyfile))
+    with pytest.raises(ValueError, match="empty value"):
+        GranolaSyncConfig.from_env()
+
+
+def test_a_value_containing_a_hash_is_preserved(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No inline-comment stripping: a # inside the key is part of the key."""
+    keyfile = tmp_path / "granola.env"
+    keyfile.write_text("GRANOLA_API_KEY=grn_a#b\n")
+    monkeypatch.setenv("GRANOLA_API_KEY_FILE", str(keyfile))
+    assert GranolaSyncConfig.from_env().api_key == "grn_a#b"
+
+
+def test_crlf_line_endings_are_handled(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    keyfile = tmp_path / "granola.env"
+    keyfile.write_bytes(b"# comment\r\nGRANOLA_API_KEY=grn_crlf\r\n")
+    monkeypatch.setenv("GRANOLA_API_KEY_FILE", str(keyfile))
+    assert GranolaSyncConfig.from_env().api_key == "grn_crlf"
