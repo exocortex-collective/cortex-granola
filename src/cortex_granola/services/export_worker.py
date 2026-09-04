@@ -23,7 +23,7 @@ import psycopg2
 import structlog
 from cortex_utils.metrics import start_metrics_server
 
-from cortex_granola.config import ExportConfig, dsn_from_env, schema_sql
+from cortex_granola.config import ExportConfig, apply_schema, dsn_from_env
 from cortex_granola.export import ExportPathError, ExportStats, export_note
 
 log = structlog.get_logger(__name__)
@@ -82,9 +82,7 @@ class ExportWorker:
 
     def ensure_schema(self) -> None:
         with self._conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(schema_sql())
-            conn.commit()
+            apply_schema(conn)
 
     def pending(self, conn: psycopg2.extensions.connection) -> list[str]:
         with conn.cursor() as cur:

@@ -211,3 +211,38 @@ def test_ensure_schema_is_reachable_from_the_worker(
     with clean.cursor() as cur:
         cur.execute("SELECT to_regclass('granola_notes_raw')")
         assert cur.fetchone()[0] is not None
+
+
+@pytest.mark.live
+def test_concurrent_schema_application_does_not_race(dsn: str) -> None:
+    """Cortex-b4o.13: all three services call ensure_schema() on boot, and
+    CREATE TABLE IF NOT EXISTS is NOT safe against a concurrent identical
+    CREATE -- two race in pg_type and one dies with a UniqueViolation.
+
+    restart: unless-stopped recovered it, which is worse than the crash: a
+    container flapping on boot reads as "Up" and hides why.
+    """
+    import threading
+
+    from cortex_granola.config import apply_schema
+
+    errors: list[Exception] = []
+    barrier = threading.Barrier(4)
+
+    def apply() -> None:
+        conn = psycopg2.connect(dsn)
+        try:
+            barrier.wait(timeout=10)  # maximise the overlap
+            apply_schema(conn)
+        except Exception as exc:  # noqa: BLE001 - collected and asserted below
+            errors.append(exc)
+        finally:
+            conn.close()
+
+    threads = [threading.Thread(target=apply) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert errors == [], f"concurrent schema application raced: {errors}"
