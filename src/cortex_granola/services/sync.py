@@ -56,9 +56,12 @@ class PollStats:
 
 
 class GranolaSync:
-    def __init__(self, config: GranolaSyncConfig) -> None:
+    def __init__(self, config: GranolaSyncConfig, client: Any | None = None) -> None:
+        """`client` is injectable so tests do not have to reach past the
+        constructor and assign a private attribute -- which they did, and which
+        breaks silently on a rename."""
         self.config = config
-        self._client = GranolaClient(config.api_key)
+        self.client = client if client is not None else GranolaClient(config.api_key)
 
     # -- connections -------------------------------------------------------
 
@@ -178,7 +181,7 @@ class GranolaSync:
         """
         if not (self.config.deny_folders or self.config.deny_spaces):
             return set()
-        folders = self._client.list_folders()
+        folders = self.client.list_folders()
         resolution = resolve_deny_list(folders, self.config.deny_folders, self.config.deny_spaces)
         # resolve_deny_list already logs unmatched terms; this is the operator
         # summary of what the deny list actually resolved to.
@@ -189,7 +192,7 @@ class GranolaSync:
             matched_spaces=list(resolution.matched_space_names),
             unmatched=list(resolution.unmatched),
         )
-        return collect_denied_note_ids(self._client, resolution.folder_ids)
+        return collect_denied_note_ids(self.client, resolution.folder_ids)
 
     def poll(self) -> PollStats:
         """One incremental pass. Safe to run on any cadence, including overlapping."""
@@ -208,11 +211,20 @@ class GranolaSync:
             denied = self._denied_note_ids()
             log.info("granola poll starting", since=since, denied=len(denied))
 
-            for summary in self._client.list_notes(updated_after=since):
+            for summary in self.client.list_notes(updated_after=since):
+                stats.seen += 1
                 note_id = summary.get("id")
                 if not note_id:
+                    # Counted as an error, not skipped. A bare `continue` here
+                    # left stats.clean True, so the watermark advanced past a
+                    # note that was never ingested -- no error, no retry, and no
+                    # row to notice missing. Holding the watermark costs a
+                    # re-scan; advancing costs the note.
+                    stats.errors += 1
+                    if stats.first_error is None:
+                        stats.first_error = f"note with no id in listing: {summary!r}"
+                    log.error("granola listing returned a note with no id", summary=summary)
                     continue
-                stats.seen += 1
                 self._ingest_one_note(conn, note_id, summary, denied, stats)
 
             self._record_poll(conn, scan_started, stats)
@@ -225,6 +237,7 @@ class GranolaSync:
             unchanged=stats.unchanged,
             tombstoned=stats.tombstoned,
             errors=stats.errors,
+            failed=stats.failed_ids,
             watermark_advanced=stats.clean,
         )
         return stats
@@ -253,7 +266,7 @@ class GranolaSync:
 
             result = ingest_one(
                 conn,
-                self._client,
+                self.client,
                 note_id,
                 api_updated_at=summary.get("updated_at"),
                 priority=priority,
@@ -265,7 +278,7 @@ class GranolaSync:
             stats.failed_ids.append(note_id)
             if stats.first_error is None:
                 stats.first_error = f"{note_id}: {exc}"
-            log.error("granola ingest failed", note_id=note_id, error=str(exc))
+            log.error("granola ingest failed", note_id=note_id, error=str(exc), exc_info=True)
             return
 
         if result.outcome is Outcome.STORED:
@@ -275,17 +288,30 @@ class GranolaSync:
         else:
             stats.unchanged += 1
 
+    def run_once(self) -> PollStats | None:
+        """One supervised pass: drain the backfill queue, then poll.
+
+        Extracted from run() so the crash-recovery branch is reachable from a
+        test -- run()'s `while True` is not. Returns None when the pass crashed.
+
+        A crash must not end the service, and it must not advance anything: the
+        watermark is only written by a completed poll, so the next pass re-scans
+        the same window.
+        """
+        try:
+            while self.check_backfill_queue():
+                pass
+            return self.poll()
+        except Exception:
+            log.error("granola poll crashed", exc_info=True)
+            return None
+
     def run(self) -> None:
         """Poll on an interval until the process is stopped."""
         self.ensure_schema()
         log.info("granola-sync started", interval_s=self.config.poll_interval_s)
         while True:
-            try:
-                self.poll()
-            except Exception:
-                # A crash in one pass must not end the service; the watermark
-                # was not advanced, so the next pass re-scans the same window.
-                log.error("granola poll crashed", exc_info=True)
+            self.run_once()
             time.sleep(self.config.poll_interval_s)
 
     # -- backfill ----------------------------------------------------------
@@ -306,7 +332,7 @@ class GranolaSync:
         try:
             stats = self.backfill(job_id, after, before)
         except Exception as exc:
-            log.error("granola backfill failed", job_id=job_id, error=str(exc))
+            log.error("granola backfill failed", job_id=job_id, error=str(exc), exc_info=True)
             self._finish_backfill(job_id, "failed", error=str(exc))
             return True
 
@@ -359,21 +385,23 @@ class GranolaSync:
         log.info("granola backfill starting", job_id=job_id, after=after, before=before)
 
         with self._conn() as conn:
-            listing = self._client.list_notes(
+            listing = self.client.list_notes(
                 created_after=after.isoformat() if after else None,
                 created_before=before.isoformat() if before else None,
             )
             for summary in listing:
+                stats.seen += 1
                 note_id = summary.get("id")
                 if not note_id:
+                    stats.errors += 1
+                    log.error("granola backfill: note with no id", job_id=job_id, summary=summary)
                     continue
-                if self._backfill_cancelled(job_id):
+                if self._backfill_cancelled(conn, job_id):
                     log.info("granola backfill cancelled", job_id=job_id, seen=stats.seen)
                     break
-                stats.seen += 1
                 self._ingest_one_note(conn, note_id, summary, denied, stats, priority=-1)
                 if stats.seen % 25 == 0:
-                    self._update_backfill_progress(job_id, stats)
+                    self._update_backfill_progress(conn, job_id, stats)
 
         log.info(
             "granola backfill finished",
@@ -384,16 +412,27 @@ class GranolaSync:
         )
         return stats
 
-    def _backfill_cancelled(self, job_id: str) -> bool:
-        """Its own connection: the scan's transaction cannot see a cancel
-        committed by someone else after it began."""
-        with self._conn() as conn, conn.cursor() as cur:
+    def _backfill_cancelled(self, conn: psycopg2.extensions.connection, job_id: str) -> bool:
+        """Has an operator cancelled this job mid-scan?
+
+        Reuses the scan's connection. The first version opened a fresh one per
+        note, on the theory that the scan's transaction could not see a cancel
+        committed after it began -- but _ingest_one_note commits or rolls back
+        after every note, so under READ COMMITTED this connection starts a new
+        transaction for each check and sees a concurrent cancel just as
+        reliably. The fresh connection bought nothing and cost a TCP connect
+        and auth round trip per note.
+        """
+        with conn.cursor() as cur:
             cur.execute("SELECT status FROM granola_backfill_jobs WHERE id = %s", (job_id,))
             row = cur.fetchone()
+        conn.commit()
         return row is not None and row[0] == "cancelled"
 
-    def _update_backfill_progress(self, job_id: str, stats: PollStats) -> None:
-        with self._conn() as conn, conn.cursor() as cur:
+    def _update_backfill_progress(
+        self, conn: psycopg2.extensions.connection, job_id: str, stats: PollStats
+    ) -> None:
+        with conn.cursor() as cur:
             cur.execute(
                 "UPDATE granola_backfill_jobs SET processed = %s, stored = %s, updated = %s "
                 "WHERE id = %s",
