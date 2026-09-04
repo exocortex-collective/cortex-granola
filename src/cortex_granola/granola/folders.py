@@ -103,6 +103,11 @@ def _match_space_terms(
     """
     known: dict[str, str] = {}
     names: dict[str, str] = {}
+    # space_id -> display name, so a space matched BY ID still reports by name.
+    # _match_folder_terms already does this for folders, and reporting an
+    # opaque spa_ id back to an operator who is trying to find their typo is
+    # the asymmetry that made the two halves inconsistent.
+    canonical: dict[str, str] = {}
     for folder in folders:
         space_id = folder.get("space_id")
         if not space_id:
@@ -111,6 +116,7 @@ def _match_space_terms(
         space_name = folder.get("space_name")
         if space_name:
             names[space_name.lower()] = space_id
+            canonical[space_id] = space_name
 
     space_ids: set[str] = set()
     matched: list[str] = []
@@ -124,7 +130,7 @@ def _match_space_terms(
             unmatched.append(term)
             continue
         space_ids.add(resolved)
-        matched.append(term.strip())
+        matched.append(canonical.get(resolved, resolved))
     return space_ids, matched, unmatched
 
 

@@ -168,6 +168,19 @@ def test_matched_names_keep_folder_and_space_provenance(folders: list[dict[str, 
     assert r.matched_space_names == (SPACE_NAME,)
 
 
+def test_a_space_matched_by_id_reports_its_name(folders: list[dict[str, Any]]) -> None:
+    """Input an id, expect a NAME -- the assertion the previous version of this
+    test could not make, because it used the name as both input and expected
+    output and so passed even if the code just echoed the term back.
+
+    It also fixes a real asymmetry: a folder matched by id reported its name
+    while a space matched by id reported the raw spa_ id, which is the least
+    useful thing to hand an operator hunting for their typo.
+    """
+    r = resolve_deny_list(folders, [], [SPACE])
+    assert r.matched_space_names == (SPACE_NAME,)
+
+
 def test_a_folder_matched_by_id_reports_its_name(folders: list[dict[str, Any]]) -> None:
     """Matching by id but reporting by name is the point: an operator who denied
     fol_bus wants the warning to say Bus Dev."""
