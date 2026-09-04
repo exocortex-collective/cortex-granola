@@ -9,11 +9,13 @@ are all invisible to a mock, which hands back whatever the code asked for.
 from __future__ import annotations
 
 import os
-import pathlib
 from collections.abc import Iterator
 
 import psycopg2
 import pytest
+from cortex_utils.queue import ensure_queue_schema
+
+from cortex_granola.config import schema_sql
 
 
 @pytest.fixture(scope="session")
@@ -31,6 +33,7 @@ def dsn() -> str:
     """
     value = os.environ.get("CORTEX_TEST_DSN")
     if value:
+        _refuse_non_test_database(value)
         return value
     if os.environ.get("CORTEX_REQUIRE_LIVE"):
         pytest.fail(
@@ -38,6 +41,37 @@ def dsn() -> str:
             "tests are required here and must not be skipped"
         )
     pytest.skip("CORTEX_TEST_DSN is not set")
+
+
+_TEST_DB_MARKERS = ("test", "postgres")
+
+
+def _refuse_non_test_database(dsn: str) -> None:
+    """Refuse a DSN whose dbname is not obviously disposable.
+
+    The `clean` fixture runs `DELETE FROM queue WHERE queue_name =
+    'granola_parse'` against the SHARED queue table -- the one gmail-sync,
+    parse-worker, attachment-worker and triage-worker all use. Pointed at the
+    real local stack it would delete live jobs, and the local stack listens on
+    the same host and port as a scratch database, so the two differ by one word
+    in an env var.
+
+    This is not hypothetical: it happened during development, and was "fixed"
+    by a line of documentation, which is not a guard.
+    """
+    dbname = ""
+    for part in dsn.split():
+        key, _, val = part.partition("=")
+        if key == "dbname":
+            dbname = val
+    if not dbname:
+        raise RuntimeError(f"CORTEX_TEST_DSN names no dbname: {dsn!r}")
+    if not any(marker in dbname.lower() for marker in _TEST_DB_MARKERS):
+        raise RuntimeError(
+            f"refusing to run destructive fixtures against dbname={dbname!r}; "
+            f"CORTEX_TEST_DSN must name a disposable database "
+            f"(one containing {' or '.join(_TEST_DB_MARKERS)})"
+        )
 
 
 @pytest.fixture
@@ -64,12 +98,12 @@ def schema(conn: psycopg2.extensions.connection) -> psycopg2.extensions.connecti
     needs its own transaction, and every test in the session shares the result.
     Test DATA still rolls back -- only the DDL persists.
     """
-    from cortex_utils.queue import ensure_queue_schema
-
     ensure_queue_schema(conn)
-    ddl = pathlib.Path(__file__).resolve().parents[1] / "migrations" / "001_granola_schema.sql"
     with conn.cursor() as cur:
-        cur.execute(ddl.read_text())
+        # The same accessor the service uses at boot. Rebuilding a parallel
+        # path here is how the packaging bug survived: the tests proved a file
+        # the deployed code would never read.
+        cur.execute(schema_sql())
     conn.commit()
     return conn
 

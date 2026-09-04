@@ -32,6 +32,10 @@ allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/cortex_granola"]
+# The DDL is package data, not a repo-relative file: an installed container
+# has no repo. Hatchling ships non-Python files under a packaged dir, and
+# this states it rather than relying on that default holding.
+artifacts = ["src/cortex_granola/migrations/*.sql"]
 
 [tool.ruff]
 line-length = 100
@@ -52,10 +56,12 @@ strict = true
 warn_unreachable = true
 
 [[tool.mypy.overrides]]
-# The ported Granola client ran from cron without a virtualenv, so it is
-# stdlib-only and untyped. Porting it to strict is its own change; doing it
-# in the same PR that moves the file would bury the move in the diff.
-# Tracked as Cortex-b4o.2 follow-up.
+# The ported Granola client ran from cron without a virtualenv and is only
+# partly annotated. Measured: removing this override yields 24 strict errors
+# across api.py, folders.py and render.py -- mostly bare `dict` needing type
+# arguments. That is its own change, not a footnote to the port. folders.py
+# is annotated in this PR because its bugs were fixed here; the rest is
+# tracked as Cortex-b4o.9.
 module = "cortex_granola.granola.*"
 ignore_errors = true
 

@@ -17,8 +17,15 @@ Three adapters are planned, in this order:
                                         accepts inbound traffic
 
 All three call `ingest_one()`. An adapter decides only WHICH note ids to ingest
-and WHEN. Nothing below this line varies by arrival, which is what keeps the
-second and third adapters cheap to add.
+and WHEN.
+
+This module deliberately does no logging. Every function returns an
+IngestResult naming the note and what happened to it, and the adapter has the
+context worth logging -- which poll, which backfill job, how far through the
+window. Logging here too would double every line at a worse altitude.
+
+Nothing below this line varies by arrival, which is what keeps the second and
+third adapters cheap to add.
 """
 
 from __future__ import annotations
@@ -42,11 +49,30 @@ class Outcome(StrEnum):
     DELETED = "deleted"  # tombstoned; export must remove its files
 
 
-@dataclass
+@dataclass(frozen=True)
 class IngestResult:
+    """What one ingest did, and the job it enqueued if it enqueued one.
+
+    UNCHANGED never carries a job_id: nothing was written, so nothing was
+    enqueued. IngestResult(id, UNCHANGED, job_id=7) was previously
+    constructible and meaningless.
+
+    The converse is deliberately NOT asserted -- see __post_init__.
+    """
+
     granola_id: str
     outcome: Outcome
     job_id: int | None = None
+
+    def __post_init__(self) -> None:
+        # Only one direction is an invariant. The other looks like one and is
+        # not: enqueue(dedup_key=...) returns None when an identical job is
+        # already pending, which is success -- "the work is already covered".
+        # An UPDATED note whose parse job is still queued from the previous
+        # change lands here legitimately with job_id None, so asserting
+        # "non-UNCHANGED implies a job_id" would raise on a correct path.
+        if self.outcome is Outcome.UNCHANGED and self.job_id is not None:
+            raise ValueError(f"UNCHANGED must not carry a job_id: {self.granola_id}")
 
 
 def ingest_one(

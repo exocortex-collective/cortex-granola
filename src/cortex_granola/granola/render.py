@@ -83,6 +83,13 @@ def render_transcript(note: dict, *, note_link: str) -> str:
 
 
 def _frontmatter(note: dict, *, kind: str, extra: list[tuple[str, str]]) -> str:
+    """The YAML block both renderers share.
+
+    `extra` is appended verbatim so each renderer can cross-link to the other
+    (summary <-> transcript) without this helper knowing which is which.
+    Calendar-event fields appear only when the note has an event; a note
+    created outside a meeting has neither start nor end.
+    """
     event = note.get("calendar_event") or {}
     folders = [f.get("name") for f in note.get("folder_membership") or [] if f.get("name")]
     spaces = [s.get("name") for s in note.get("space_membership") or [] if s.get("name")]

@@ -105,8 +105,15 @@ CREATE TABLE IF NOT EXISTS granola_note_folders (
 CREATE TABLE IF NOT EXISTS granola_sync_state (
     source           TEXT PRIMARY KEY,
     last_synced_at   TIMESTAMPTZ,
-    -- Re-scan window applied to last_synced_at on each poll, so a note edited
-    -- mid-sync is not skipped. Config default, overridable per source.
+    -- Re-scan window applied to last_synced_at WHEN THE WINDOW IS READ, never
+    -- subtracted before the write -- storing (now - overlap) compounds it on
+    -- every run and walks the watermark backwards without bound.
+    --
+    -- THIS COLUMN IS THE SINGLE SOURCE OF TRUTH once the row exists.
+    -- GranolaSyncConfig.overlap_minutes seeds it on first insert only, so a
+    -- per-source override survives restarts and redeploys. Two live values for
+    -- one window is how an overlap gets applied twice, or an override gets
+    -- silently ignored.
     overlap_minutes  INTEGER NOT NULL DEFAULT 60,
     last_poll_at     TIMESTAMPTZ,
     last_error       TEXT

@@ -29,7 +29,7 @@ TRANSCRIPT_PAGE_SIZE = 100
 
 
 class GranolaError(RuntimeError):
-    def __init__(self, status: int, message: str, code: str | None = None):
+    def __init__(self, status: int, message: str, code: str | None = None) -> None:
         super().__init__(f"HTTP {status}: {message}")
         self.status = status
         self.code = code
@@ -40,7 +40,7 @@ class TranscriptTooLarge(GranolaError):
 
 
 class _TokenBucket:
-    def __init__(self, rate: float, burst: int):
+    def __init__(self, rate: float, burst: int) -> None:
         self.rate = rate
         self.capacity = burst
         self.tokens = float(burst)
@@ -59,7 +59,7 @@ class _TokenBucket:
 
 
 class GranolaClient:
-    def __init__(self, api_key: str, timeout: int = 60, max_retries: int = 5):
+    def __init__(self, api_key: str, timeout: int = 60, max_retries: int = 5) -> None:
         if not api_key:
             raise ValueError("GRANOLA_API_KEY is empty")
         self._key = api_key
@@ -98,7 +98,8 @@ class GranolaClient:
                 ) as resp:
                     return json.load(resp)
             except urllib.error.HTTPError as exc:
-                body = exc.read().decode("utf-8", "replace")
+                with exc:
+                    body = exc.read().decode("utf-8", "replace")
                 code = _error_code(body)
                 if exc.code == 413 or code == "TRANSCRIPT_TOO_LARGE":
                     raise TranscriptTooLarge(exc.code, body, code) from exc
