@@ -1,19 +1,26 @@
 # Configuration
 
+The four reviewers this repo adds beyond the family baseline, and why:
+
+| Reviewer | Why it is here |
+|----------|----------------|
+| `clock-discipline-reviewer` | From cortex-utils. Every poll compares an API `updated_at` against a Postgres-stamped column; a second clock here loses notes. |
+| `transactional-decision-reviewer` | From cortex-utils. `ingest_one()` deliberately does not commit, so the caller owns a transaction spanning a raw upsert and a queue enqueue. |
+| `watermark-integrity-reviewer` | Repo-specific. The incremental watermark is the only component here whose failure mode is silent data loss. |
+| `export-destructiveness-reviewer` | Repo-specific. The export worker deletes files inside the user's Obsidian vault. |
+
+`defaults_version_checked` is pinned to the plugin version these additions were
+authored against -- not copied from a sibling repo, whose audit says nothing
+about this file.
+
 ```json
 {
-  "defaults_version_checked": "1.6.0",
+  "defaults_version_checked": "1.5.1",
   "disabled": [
     "code-simplifier",
     "comment-analyzer",
     "silent-failure-hunter"
   ],
-  "repo_additions": {
-    "clock-discipline-reviewer": "From cortex-utils. This repo compares an API updated_at against a Postgres-stamped column on every poll; a second clock here loses notes.",
-    "transactional-decision-reviewer": "From cortex-utils. ingest_one() deliberately does not commit, so the caller owns a transaction spanning a raw upsert and a queue enqueue.",
-    "watermark-integrity-reviewer": "Repo-specific. The incremental watermark is the only component whose failure mode is silent data loss.",
-    "export-destructiveness-reviewer": "Repo-specific. The export worker deletes files inside the user's Obsidian vault."
-  },
   "overlap_acknowledged": {
     "test-coverage-reviewer": {
       "overlaps_with": "pr-test-analyzer",
@@ -23,6 +30,11 @@
       "overlaps_with": "clock-discipline-reviewer",
       "reason": "clock-discipline asks which clock produced a value; watermark-integrity asks whether the stored value may move at all given what the run did. A client-clock watermark is both findings, and both are correct."
     }
+  },
+  "independent_validator": {
+    "enabled": true,
+    "skip_for": [],
+    "uncertain_action": "post_with_annotation"
   }
 }
 ```
