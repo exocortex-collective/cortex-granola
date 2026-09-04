@@ -346,3 +346,68 @@ def test_tombstoned_notes_are_handled_before_new_ones(
     clean.commit()
 
     assert worker.pending(clean)[0] == NOTE, "the tombstone comes first"
+
+
+# --- the cross-links ------------------------------------------------------
+
+
+@pytest.mark.live
+def test_the_transcript_link_actually_resolves(
+    clean: psycopg2.extensions.connection, config: ExportConfig
+) -> None:
+    """A link that points at nothing is not an error in Obsidian, it is just a
+    link that does not go anywhere. The first version of this arithmetic was
+    off by one '..' and would have shipped across every note in the vault.
+    """
+    _store(clean, _raw())
+    export_note(clean, config, NOTE)
+    clean.commit()
+
+    note = config.notes_dir / _files(config.notes_dir)[0]
+    link = next(
+        line.split(":", 1)[1].strip().strip('"')
+        for line in note.read_text().splitlines()
+        if line.startswith("transcript_file:")
+    )
+    assert (note.parent / link).resolve().exists(), f"{link} does not resolve"
+
+
+@pytest.mark.live
+def test_the_summary_link_actually_resolves(
+    clean: psycopg2.extensions.connection, config: ExportConfig
+) -> None:
+    _store(clean, _raw())
+    export_note(clean, config, NOTE)
+    clean.commit()
+
+    transcript = config.transcripts_dir / _files(config.transcripts_dir)[0]
+    link = next(
+        line.split(":", 1)[1].strip().strip('"')
+        for line in transcript.read_text().splitlines()
+        if line.startswith("summary_file:")
+    )
+    assert (transcript.parent / link).resolve().exists(), f"{link} does not resolve"
+
+
+@pytest.mark.live
+def test_links_resolve_when_the_trees_are_nested_differently(
+    clean: psycopg2.extensions.connection, tmp_path: Path
+) -> None:
+    """The compose file puts both trees under meetings/; a link computed from
+    path-component counting rather than the real paths breaks as soon as the
+    two trees are not siblings at the same depth."""
+    cfg = ExportConfig(
+        notes_dir=tmp_path / "meetings" / "notes",
+        transcripts_dir=tmp_path / "archive" / "deep" / "transcripts",
+    )
+    _store(clean, _raw())
+    export_note(clean, cfg, NOTE)
+    clean.commit()
+
+    note = cfg.notes_dir / _files(cfg.notes_dir)[0]
+    link = next(
+        line.split(":", 1)[1].strip().strip('"')
+        for line in note.read_text().splitlines()
+        if line.startswith("transcript_file:")
+    )
+    assert (note.parent / link).resolve().exists()

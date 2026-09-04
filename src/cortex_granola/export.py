@@ -156,16 +156,23 @@ def _render(raw: dict[str, Any], kind: str, config: ExportConfig, wanted: dict[s
 
 
 def _link(config: ExportConfig, wanted: dict[str, str], to_summary: bool = False) -> str:
-    """A relative link between the two trees, as the file-based syncer produced.
+    """A relative link from one tree's file to the other's.
 
-    Computed from the configured directories rather than hardcoded, so the two
-    trees can be renamed without every cross-link in the vault going stale.
+    relpath between the two REAL paths, rather than counting "..". The first
+    version added one ".." per component of the relative path -- including the
+    filename -- and then appended relpath's own "..", double-counting by one:
+
+        ../../../transcripts/2026/x.md   (resolves outside the vault)
+        ../../transcripts/2026/x.md      (correct)
+
+    Nothing catches that. An Obsidian link that points at nothing is not an
+    error, it is just a link that does not go anywhere, so it would have shipped
+    across every note in the vault and been noticed by a person clicking one.
     """
-    src = config.transcripts_dir if to_summary else config.notes_dir
-    dst = config.notes_dir if to_summary else config.transcripts_dir
     rel = wanted[SUMMARY]
-    depth = len(Path(rel).parts)
-    return "/".join([".."] * depth + [os.path.relpath(dst, src)] + [rel])
+    src_dir = (config.transcripts_dir if to_summary else config.notes_dir) / Path(rel).parent
+    dst_file = (config.notes_dir if to_summary else config.transcripts_dir) / rel
+    return os.path.relpath(dst_file, src_dir)
 
 
 def _load(
