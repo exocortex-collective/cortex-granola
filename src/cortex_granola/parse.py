@@ -257,25 +257,36 @@ def _write_folders(
                 """
                 INSERT INTO granola_folders (folder_id, name, parent_id, space_id, space_name)
                 VALUES (%s, %s, %s, %s, %s)
+                -- space_name only. The column split with sync._store_folders
+                -- has to be genuinely disjoint, and an earlier version listed
+                -- name and space_id here too: a re-parse of a months-old
+                -- payload then reverted a rename that sync had just written
+                -- from the live endpoint. sync owns name, parent_id, space_id
+                -- and excluded; parse owns space_name, which /v1/folders does
+                -- not carry.
                 ON CONFLICT (folder_id) DO UPDATE
-                   SET name = EXCLUDED.name,
-                       space_id = EXCLUDED.space_id,
-                       space_name = EXCLUDED.space_name,
+                   SET space_name = EXCLUDED.space_name,
                        updated_at = NOW()
+                 WHERE granola_folders.space_name IS DISTINCT FROM EXCLUDED.space_name
                 """,
                 (
                     folder_id,
                     folder.get("name"),
-                    # NULL, and deliberately absent from the DO UPDATE above so
-                    # a re-parse cannot clobber a value someone else set.
+                    # Always NULL, and absent from the DO UPDATE above, because
+                    # sync._sync_folders owns the hierarchy: it writes from
+                    # /v1/folders, which is authoritative and also covers folders
+                    # no ingested note points at.
                     #
-                    # A note's folder_membership carries no parent: only
-                    # /v1/folders does, and nothing writes this table from that
-                    # endpoint yet. The earlier comment here claimed "the
-                    # deny-list walk rebuilds the tree from the API anyway" --
-                    # it does not. folders.py reads the tree into memory for
-                    # deny resolution and never persists it, so the hierarchy is
-                    # simply not populated. Tracked as Cortex-b4o.12.
+                    # Membership entries DO carry parent_folder_id, and an
+                    # earlier version of this seeded the column from it. That
+                    # introduced a failure that could not happen on main: this
+                    # loop iterates in payload order, parent_id references this
+                    # same table, and a child arriving before its parent is a
+                    # ForeignKeyViolation -- deterministic, and repeated on every
+                    # retry because the retry re-reads the same JSONB. Seeding a
+                    # value sync would overwrite anyway was not worth a new hard
+                    # parse failure whose trigger is Granola's serialisation
+                    # order.
                     None,
                     space_id,
                     spaces.get(space_id),
