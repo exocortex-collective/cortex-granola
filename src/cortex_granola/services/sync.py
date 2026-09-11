@@ -223,6 +223,18 @@ class GranolaSync:
             unmatched=list(resolution.unmatched),
         )
         self._store_folders(conn, folders, resolution.folder_ids)
+        # Committed here, not left to the caller. Folder metadata is independent
+        # of note ingest, and sharing the poll's transaction meant the FIRST
+        # note's rollback in _ingest_one_note threw the whole tree away -- so a
+        # single 404 on the first note left `excluded` false forever, on the
+        # column this write exists to populate. backfill() made it worse: it has
+        # no terminal commit, so an empty date range discarded the writes while
+        # marking the job completed.
+        #
+        # It also bounds the lock. Holding a row lock on every folder across
+        # ingest_one's HTTP fetch was measured deadlocking against the parse
+        # worker, which takes the same locks in a different order.
+        conn.commit()
 
         if not (self.config.deny_folders or self.config.deny_spaces):
             return set()
@@ -241,14 +253,27 @@ class GranolaSync:
         so an unresolvable parent is stored as NULL rather than failing the
         whole poll over one folder's missing ancestor.
         """
-        known = {f.get("id") for f in folders if f.get("id")}
+        # Tracks rows actually INSERTED, not ids the API mentioned. The two
+        # diverge exactly where it matters: in a cycle every member is "known",
+        # so nothing would be nulled and the insert would die on the
+        # self-referencing FK -- taking the whole poll with it, and contradicting
+        # _parents_first's own promise that the parent gets nulled out.
+        written: set[str] = set()
         with conn.cursor() as cur:
             for folder in _parents_first(folders):
-                folder_id = folder.get("id")
-                if not folder_id:
-                    continue
+                # _parents_first drops id-less entries, so folder["id"] is safe
+                # here. An `if not folder_id: continue` guard used to sit here
+                # and was unreachable -- the one statement coverage could not
+                # reach in this function.
+                folder_id = folder["id"]
                 parent_id = folder.get("parent_folder_id")
-                if parent_id not in known:
+                if parent_id not in written:
+                    if parent_id is not None:
+                        log.warning(
+                            "granola folder parent not resolvable; storing NULL",
+                            folder_id=folder_id,
+                            parent_id=parent_id,
+                        )
                     parent_id = None
                 cur.execute(
                     """
@@ -261,6 +286,15 @@ class GranolaSync:
                            space_id = EXCLUDED.space_id,
                            excluded = EXCLUDED.excluded,
                            updated_at = NOW()
+                     -- Only when something actually changed. Unguarded, this
+                     -- wrote a dead tuple on every poll -- ~96 a day per folder,
+                     -- forever -- and made updated_at mean "last time a poll
+                     -- ran" rather than "last time this folder changed".
+                     WHERE (granola_folders.name, granola_folders.parent_id,
+                            granola_folders.space_id, granola_folders.excluded)
+                           IS DISTINCT FROM
+                           (EXCLUDED.name, EXCLUDED.parent_id,
+                            EXCLUDED.space_id, EXCLUDED.excluded)
                     """,
                     (
                         folder_id,
@@ -270,6 +304,7 @@ class GranolaSync:
                         folder_id in excluded_ids,
                     ),
                 )
+                written.add(folder_id)
         # space_name is deliberately not written here: /v1/folders carries a
         # space_id but no space name. parse.py fills it from a note's
         # space_membership, and overwriting it with NULL on every poll would
@@ -590,6 +625,14 @@ def _parents_first(folders: list[dict[str, Any]]) -> list[dict[str, Any]]:
             else:
                 remaining.append(folder)
         if not progressed:
+            # A cycle, which the API should not produce. Logged rather than
+            # swallowed: it degrades the stored hierarchy, and an
+            # assumed-impossible condition that leaves no trace is how it stays
+            # assumed-impossible.
+            log.warning(
+                "granola folder hierarchy has a cycle; storing the members as roots",
+                folder_ids=sorted(f["id"] for f in remaining),
+            )
             ordered.extend(remaining)
             break
         pending = remaining

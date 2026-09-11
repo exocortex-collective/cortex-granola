@@ -1,5 +1,13 @@
 """Shared fixtures.
 
+One runner at a time per database. These tests share tables and TRUNCATE
+between cases, so two suites against one CORTEX_TEST_DSN do not merely race --
+measured, they block on each other's row locks and hang. CI is a single job, so
+this only bites locally when something parallel is driving the suite. Symptom to
+recognise: different tests failing on each run, which reads as order-dependence
+and is not. Four serial runs in a row are byte-identical.
+
+
 Live tests take a real Postgres from CORTEX_TEST_DSN rather than a mock. The
 defects this suite exists to catch -- a watermark that advances after a failure,
 an ON CONFLICT that fires when it should not, a dedup_key that does not dedup --

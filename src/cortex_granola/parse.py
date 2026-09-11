@@ -257,27 +257,37 @@ def _write_folders(
                 """
                 INSERT INTO granola_folders (folder_id, name, parent_id, space_id, space_name)
                 VALUES (%s, %s, %s, %s, %s)
+                -- space_name only. The column split with sync._store_folders
+                -- has to be genuinely disjoint, and an earlier version listed
+                -- name and space_id here too: a re-parse of a months-old
+                -- payload then reverted a rename that sync had just written
+                -- from the live endpoint. sync owns name, parent_id, space_id
+                -- and excluded; parse owns space_name, which /v1/folders does
+                -- not carry.
                 ON CONFLICT (folder_id) DO UPDATE
-                   SET name = EXCLUDED.name,
-                       space_id = EXCLUDED.space_id,
-                       space_name = EXCLUDED.space_name,
+                   SET space_name = EXCLUDED.space_name,
                        updated_at = NOW()
+                 WHERE granola_folders.space_name IS DISTINCT FROM EXCLUDED.space_name
                 """,
                 (
                     folder_id,
                     folder.get("name"),
-                    # Only ever an INSERT value, never an UPDATE one: the DO
-                    # UPDATE above omits parent_id on purpose. sync._sync_folders
-                    # writes the hierarchy from /v1/folders, which is the
-                    # authoritative source and also covers folders no ingested
-                    # note points at. A re-parse must not narrow that.
+                    # Always NULL, and absent from the DO UPDATE above, because
+                    # sync._sync_folders owns the hierarchy: it writes from
+                    # /v1/folders, which is authoritative and also covers folders
+                    # no ingested note points at.
                     #
-                    # Membership entries do carry parent_folder_id -- measured,
-                    # 122 of 122 in this workspace -- so it seeds the row when
-                    # parse happens to get there first. The FK is self-
-                    # referencing, so a parent this note has never seen is
-                    # stored as NULL for sync to correct.
-                    _membership_parent(folder, memberships),
+                    # Membership entries DO carry parent_folder_id, and an
+                    # earlier version of this seeded the column from it. That
+                    # introduced a failure that could not happen on main: this
+                    # loop iterates in payload order, parent_id references this
+                    # same table, and a child arriving before its parent is a
+                    # ForeignKeyViolation -- deterministic, and repeated on every
+                    # retry because the retry re-reads the same JSONB. Seeding a
+                    # value sync would overwrite anyway was not worth a new hard
+                    # parse failure whose trigger is Granola's serialisation
+                    # order.
+                    None,
                     space_id,
                     spaces.get(space_id),
                 ),
@@ -287,18 +297,3 @@ def _write_folders(
                 "ON CONFLICT DO NOTHING",
                 (granola_id, folder_id),
             )
-
-
-def _membership_parent(folder: dict[str, Any], memberships: list[dict[str, Any]]) -> str | None:
-    """The folder's parent, if this payload also names the parent as a folder.
-
-    granola_folders.parent_id references granola_folders, so pointing at a
-    folder no row exists for yet would fail the insert. Membership lists only
-    the folders a note belongs to, which need not include an ancestor, so the
-    parent is kept only when it is present in the same payload.
-    """
-    parent_id = folder.get("parent_folder_id")
-    if not parent_id:
-        return None
-    known = {other.get("id") for other in memberships}
-    return str(parent_id) if parent_id in known else None
