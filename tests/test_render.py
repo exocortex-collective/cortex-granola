@@ -9,6 +9,7 @@ tested here at least as heavily as the document bodies.
 from __future__ import annotations
 
 import datetime as dt
+from typing import Any
 
 import pytest
 
@@ -27,8 +28,8 @@ from cortex_granola.granola.render import (
 )
 
 
-def note(**overrides: object) -> dict:
-    base: dict = {
+def note(**overrides: object) -> dict[str, Any]:
+    base: dict[str, Any] = {
         "id": "not_1d3tmYTlCICgjy",
         "title": "Quarterly yoghurt budget review",
         "created_at": "2026-01-27T15:30:00Z",
@@ -75,10 +76,14 @@ def test_slugify_truncates_without_a_trailing_hyphen() -> None:
     assert not slug.endswith("-")
 
 
-def test_slugify_is_stable_for_the_same_title() -> None:
-    # The export worker deletes by previously-rendered path. An unstable slug
-    # would orphan a file on every run.
-    assert slugify("All Hands Weekly") == slugify("All Hands Weekly")
+def test_slugify_is_pinned_for_a_real_folder_name() -> None:
+    """The export worker deletes by previously-rendered path, so a slug that
+    changes orphans the old file and re-writes the note under a new name.
+
+    Pinned to a literal rather than asserting slugify(x) == slugify(x), which is
+    true of any pure function -- including one whose body is `return "MUTANT"`.
+    """
+    assert slugify("All Hands Weekly") == "all-hands-weekly"
 
 
 # -- timestamps and paths --------------------------------------------------
@@ -114,10 +119,17 @@ def test_note_timestamp_is_none_when_nothing_is_usable() -> None:
     assert note_timestamp(note(created_at=None, calendar_event=None)) is None
 
 
-def test_note_date_falls_back_to_now_for_a_filename() -> None:
-    before = dt.datetime.now(dt.UTC)
+def test_note_date_falls_back_to_utc_now_for_a_filename() -> None:
+    """The fallback must be UTC, not merely the right instant.
+
+    Both consumers format it as %Y-%m-%d. An aware-vs-aware bracket compares
+    instants and ignores tzinfo, so it stays green if the fallback becomes
+    now(ZoneInfo("America/Denver")) -- same instant, filename off by a day for
+    six hours out of every twenty-four.
+    """
     result = note_date(note(created_at=None, calendar_event=None))
-    assert before <= result <= dt.datetime.now(dt.UTC)
+    assert result.utcoffset() == dt.timedelta(0)
+    assert abs((result - dt.datetime.now(dt.UTC)).total_seconds()) < 60
 
 
 def test_relative_path_shape() -> None:
@@ -148,19 +160,35 @@ def test_relative_path_disambiguates_same_day_same_title() -> None:
     [
         ("2026-01-27T15:30:00Z", dt.datetime(2026, 1, 27, 15, 30, tzinfo=dt.UTC)),
         ("2026-01-27T15:30:00+00:00", dt.datetime(2026, 1, 27, 15, 30, tzinfo=dt.UTC)),
-        ("2026-04-02T14:00:00-06:00", dt.datetime(2026, 4, 2, 20, 0, tzinfo=dt.UTC)),
         ("not a date", None),
         ("", None),
         (None, None),
+        (42, None),
     ],
 )
-def test_parse_ts(raw: str | None, expected: dt.datetime | None) -> None:
+def test_parse_ts(raw: object, expected: dt.datetime | None) -> None:
     result = _parse_ts(raw)
     if expected is None:
         assert result is None
     else:
-        assert result is not None
-        assert result.astimezone(dt.UTC) == expected
+        assert result == expected
+
+
+def test_parse_ts_preserves_the_offset_as_written() -> None:
+    """The offset must survive, because .date() is taken from this result.
+
+    meeting_date is a DATE column and the filename is a %Y-%m-%d, both from
+    .date() on what this returns. An earlier version asserted through
+    .astimezone(UTC), which is a no-op for equality between aware datetimes and
+    normalised away the one property under test -- so a trailing
+    .astimezone(dt.UTC) inside _parse_ts would have gone unnoticed while moving
+    every evening meeting to the next day.
+    """
+    result = _parse_ts("2026-04-02T20:00:00-06:00")
+    assert result is not None
+    assert result.utcoffset() == dt.timedelta(hours=-6)
+    assert result.date() == dt.date(2026, 4, 2)
+    assert result.astimezone(dt.UTC).date() == dt.date(2026, 4, 3)
 
 
 # -- speaker labels --------------------------------------------------------
@@ -180,12 +208,12 @@ def test_parse_ts(raw: str | None, expected: dt.datetime | None) -> None:
         ({}, "Unknown"),
     ],
 )
-def test_speaker_label_precedence(speaker: dict, expected: str) -> None:
+def test_speaker_label_precedence(speaker: dict[str, Any], expected: str) -> None:
     assert _speaker_label(speaker) == expected
 
 
 @pytest.mark.parametrize("bad", [{"name": None}, {"name": ""}, {"name": 42}])
-def test_speaker_label_ignores_a_non_string_name(bad: dict) -> None:
+def test_speaker_label_ignores_a_non_string_name(bad: dict[str, Any]) -> None:
     # A null name in the payload must fall through, not become the heading
     # "None" over a block of transcript.
     assert _speaker_label({**bad, "source": "microphone"}) == "Me"
@@ -236,10 +264,15 @@ def test_attendee_lines_drops_records_with_neither_name_nor_email() -> None:
 
 
 def test_attendee_lines_are_sorted() -> None:
+    """Pinned to the expected order, not to sorted(result).
+
+    `result == sorted(result)` is satisfied by `return []`, so the only
+    ordering test in the file passed with the function deleted.
+    """
     result = _attendee_lines(
         note(attendees=[{"email": "zeta@x.com"}, {"email": "alpha@x.com"}, {"email": "mid@x.com"}])
     )
-    assert result == sorted(result)
+    assert result == ["alpha@x.com", "mid@x.com", "zeta@x.com"]
 
 
 # -- yaml escaping ---------------------------------------------------------
@@ -360,6 +393,72 @@ def test_render_transcript_skips_empty_segments() -> None:
     )
     # A blank segment must not open its own speaker block.
     assert rendered.count("**Me**") == 1
+
+
+def test_frontmatter_renders_populated_lists() -> None:
+    """_yaml_list's non-empty branch, which the empty fixture never reached.
+
+    _attendee_lines is well covered in isolation, but nothing checked that its
+    output survives into a document with the right indentation and quoting.
+    """
+    rendered = render_note(
+        note(
+            attendees=[{"name": 'Oat "The Boss" Benson', "email": "oat@granola.ai"}],
+            folder_membership=[{"id": "fol_x", "name": "Bus Dev"}],
+            space_membership=[{"id": "spa_x", "name": "Valid Eval team"}],
+        ),
+        include_private_notes=False,
+        transcript_link=None,
+    )
+    assert '  - "Oat \\"The Boss\\" Benson <oat@granola.ai>"' in rendered
+    assert 'folders:\n  - "Bus Dev"' in rendered
+    assert 'spaces:\n  - "Valid Eval team"' in rendered
+
+
+def test_frontmatter_skips_malformed_membership_entries() -> None:
+    # Export reads these back from JSONB, where nothing guarantees the shape.
+    rendered = render_note(
+        note(folder_membership=["not a dict", {"id": "fol_x"}, {"name": 42}, {"name": "Real"}]),
+        include_private_notes=False,
+        transcript_link=None,
+    )
+    assert 'folders:\n  - "Real"' in rendered
+    assert "42" not in rendered
+
+
+def test_render_note_includes_web_url_when_present() -> None:
+    rendered = render_note(
+        note(web_url="https://notes.granola.ai/d/abc"),
+        include_private_notes=False,
+        transcript_link=None,
+    )
+    assert 'web_url: "https://notes.granola.ai/d/abc"' in rendered
+
+
+def test_render_note_omits_web_url_when_absent() -> None:
+    rendered = render_note(note(web_url=None), include_private_notes=False, transcript_link=None)
+    assert "web_url:" not in rendered
+
+
+@pytest.mark.parametrize("bad_title", [None, 42, {"nested": "dict"}, ""])
+def test_relative_path_survives_a_non_string_title(bad_title: object) -> None:
+    """A title straight out of JSONB reached unicodedata.normalize and raised
+    TypeError there, taking down the export of one note."""
+    assert relative_path(note(title=bad_title)).endswith("untitled-not_1d3tmYTlCICgjy.md")
+
+
+@pytest.mark.parametrize(
+    "segments",
+    [
+        ["not a dict"],
+        [{"text": 42, "speaker": {"source": "microphone"}}],
+        [{"text": "ok", "speaker": "not a dict"}],
+        "not a list",
+    ],
+)
+def test_render_transcript_survives_malformed_segments(segments: object) -> None:
+    # Previously AttributeError: 'dict' object has no attribute 'strip'.
+    render_transcript(note(transcript=segments), note_link="../../n/x.md")
 
 
 def test_both_documents_carry_the_granola_id_and_their_kind() -> None:

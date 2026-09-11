@@ -1,31 +1,42 @@
 """Thin client for the Granola public API (https://public-api.granola.ai).
 
-Stdlib only, so the syncer runs from cron without a virtualenv.
+Stdlib only. That began as a constraint -- the original syncer ran from cron
+with no virtualenv -- and survives the move into a uv-managed container because
+the client has no need urllib does not meet, not because anything still requires
+it.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Mapping
 from typing import Any
 
 log = logging.getLogger(__name__)
 
 # Granola's payloads are JSON objects whose shape the API owns, so the client
-# carries them as plain dicts and lets parse.py impose meaning. The alias keeps
-# that decision legible rather than spelling `dict[str, Any]` out sixteen times.
+# carries them as plain dicts and lets parse.py impose meaning. The alias names
+# that decision; parse.py and export.py spell the same type out longhand.
 JsonDict = dict[str, Any]
+
+# Query-string values, which are not payloads and must not borrow JsonDict:
+# every call site builds one of these literally and exhaustively.
+QueryParams = Mapping[str, str | int | None]
 
 BASE_URL = "https://public-api.granola.ai"
 
 # Documented limits: 25 request burst, 5 requests/second sustained.
 RATE_PER_SEC = 5.0
 BURST = 25
+
+# Ceiling for both the exponential backoff and an honoured Retry-After.
+MAX_BACKOFF = 60.0
 
 # Page size ceilings from the OpenAPI spec.
 NOTES_PAGE_SIZE = 30
@@ -45,47 +56,68 @@ class TranscriptTooLarge(GranolaError):
 
 
 class _TokenBucket:
-    def __init__(self, rate: float, burst: int) -> None:
+    """Leaky bucket over an injectable clock.
+
+    The clock is a constructor argument rather than a module import so tests can
+    drive it without monkeypatching `time`, which is a process-wide singleton:
+    patching it means any background thread's sleep lands in the fake, and the
+    exact-sequence assertions in the suite become order-dependent.
+    """
+
+    def __init__(
+        self,
+        rate: float,
+        burst: int,
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
         self.rate = rate
         self.capacity = burst
         self.tokens = float(burst)
-        self.updated = time.monotonic()
+        self._monotonic = monotonic
+        self._sleep = sleep
+        self.updated = monotonic()
 
     def take(self) -> None:
-        now = time.monotonic()
+        now = self._monotonic()
         self.tokens = min(self.capacity, self.tokens + (now - self.updated) * self.rate)
         self.updated = now
         if self.tokens < 1.0:
-            time.sleep((1.0 - self.tokens) / self.rate)
+            self._sleep((1.0 - self.tokens) / self.rate)
             self.tokens = 0.0
-            self.updated = time.monotonic()
+            self.updated = self._monotonic()
         else:
             self.tokens -= 1.0
 
 
 class GranolaClient:
-    def __init__(self, api_key: str, timeout: int = 60, max_retries: int = 5) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        timeout: int = 60,
+        max_retries: int = 5,
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
         if not api_key:
             raise ValueError("GRANOLA_API_KEY is empty")
+        if max_retries < 0:
+            # Otherwise the retry loop body never runs and _get falls through to
+            # the "unreachable" assertion at the bottom, which is neither
+            # unreachable nor a GranolaError.
+            raise ValueError(f"max_retries must be >= 0, got {max_retries}")
         self._key = api_key
         self._timeout = timeout
         self._max_retries = max_retries
-        self._bucket = _TokenBucket(RATE_PER_SEC, BURST)
+        self._sleep = sleep
+        self._bucket = _TokenBucket(RATE_PER_SEC, BURST, monotonic=monotonic, sleep=sleep)
 
     # -- transport ---------------------------------------------------------
 
-    def _get(self, path: str, params: JsonDict | None = None) -> JsonDict:
-        query = {k: v for k, v in (params or {}).items() if v is not None}
-        url = f"{BASE_URL}{path}"
-        if query:
-            url += "?" + urllib.parse.urlencode(query)
-
-        # Note ids reach this path (`/v1/notes/{id}`), and the base URL is the
-        # only thing fixing the scheme. urlopen honours file:// and custom
-        # schemes, so a crafted id that escaped the path would read local files
-        # rather than fail. Asserting the scheme costs nothing and closes it.
-        if not url.startswith("https://"):
-            raise GranolaError(0, f"refusing a non-https request URL: {url!r}")
+    def _get(self, path: str, params: QueryParams | None = None) -> JsonDict:
+        url = _build_url(path, params)
 
         for attempt in range(self._max_retries + 1):
             self._bucket.take()
@@ -101,40 +133,40 @@ class GranolaClient:
                 with urllib.request.urlopen(  # nosec B310 - https asserted above
                     req, timeout=self._timeout
                 ) as resp:
-                    payload = json.load(resp)
-                # An HTML error page or a bare JSON array would otherwise fail
-                # much later, as an AttributeError inside a caller.
-                if not isinstance(payload, dict):
-                    raise GranolaError(
-                        0, f"expected a JSON object from {path}, got {type(payload).__name__}"
-                    )
-                return payload
+                    return _decode(resp, path)
             except urllib.error.HTTPError as exc:
                 with exc:
                     body = exc.read().decode("utf-8", "replace")
-                code = _error_code(body)
+                code = _error_code(body, allow_substring=exc.code in (400, 413))
                 if exc.code == 413 or code == "TRANSCRIPT_TOO_LARGE":
                     raise TranscriptTooLarge(exc.code, body, code) from exc
                 retryable = exc.code == 429 or exc.code >= 500
                 if not retryable or attempt == self._max_retries:
                     raise GranolaError(exc.code, body, code) from exc
-                delay = _retry_after(exc) or min(60.0, 2.0**attempt)
+                delay = _retry_after(exc) or min(MAX_BACKOFF, 2.0**attempt)
                 log.warning("HTTP %s on %s; retrying in %.1fs", exc.code, path, delay)
-                time.sleep(delay)
+                self._sleep(delay)
             except urllib.error.URLError as exc:
                 if attempt == self._max_retries:
                     raise
-                delay = min(60.0, 2.0**attempt)
+                delay = min(MAX_BACKOFF, 2.0**attempt)
                 log.warning("network error on %s (%s); retrying in %.1fs", path, exc.reason, delay)
-                time.sleep(delay)
+                self._sleep(delay)
 
         raise AssertionError("unreachable")
 
-    def _paginate(self, path: str, key: str, params: JsonDict) -> Iterator[JsonDict]:
+    def _paginate(self, path: str, key: str, params: QueryParams) -> Iterator[JsonDict]:
         cursor: str | None = None
         while True:
             page = self._get(path, {**params, "cursor": cursor})
-            items = page.get(key) or []
+            if key not in page:
+                # The likelier failure than a wrong type: a renamed or dropped
+                # collection key reads as an empty page, the poll reports clean,
+                # and the watermark advances over notes nothing will rescan.
+                raise GranolaError(0, f"{path} returned no {key!r} key: {sorted(page)}")
+            items = page[key]
+            if items is None:
+                items = []
             if not isinstance(items, list):
                 raise GranolaError(
                     0, f"expected a list at {key!r} from {path}, got {type(items).__name__}"
@@ -177,25 +209,73 @@ class GranolaClient:
 
     def get_note(self, note_id: str, *, include_transcript: bool = False) -> JsonDict:
         return self._get(
-            f"/v1/notes/{note_id}",
+            f"/v1/notes/{_path_segment(note_id)}",
             {"include": "transcript"} if include_transcript else None,
         )
 
     def get_transcript(self, note_id: str) -> list[JsonDict]:
         return list(
             self._paginate(
-                f"/v1/notes/{note_id}/transcript",
+                f"/v1/notes/{_path_segment(note_id)}/transcript",
                 "transcript",
                 {"page_size": TRANSCRIPT_PAGE_SIZE},
             )
         )
 
 
-def _error_code(body: str) -> str | None:
+def _build_url(path: str, params: QueryParams | None) -> str:
+    """The absolute request URL, with the scheme asserted.
+
+    Note ids reach the path (`/v1/notes/{id}`), and the base URL is the only
+    thing fixing the scheme. urlopen honours file:// and custom schemes, so an
+    id that escaped the path would read local files rather than fail. The
+    per-segment quoting in _path_segment closes the `?`/`#`/`/` cases; this
+    closes the scheme.
+    """
+    query = {k: v for k, v in (params or {}).items() if v is not None}
+    url = f"{BASE_URL}{path}"
+    if query:
+        url += "?" + urllib.parse.urlencode(query)
+    if not url.startswith("https://"):
+        raise GranolaError(0, f"refusing a non-https request URL: {url!r}")
+    return url
+
+
+def _decode(resp: Any, path: str) -> JsonDict:
+    """The response body as a JSON object, or a GranolaError explaining why not.
+
+    `resp` is Any because json.load's stub is typed against _typeshed's private
+    SupportsRead, which has no runtime home. Restating that protocol here would
+    trade one honest Any for an unused `length` parameter that vulture correctly
+    reports as dead.
+    """
+    try:
+        payload = json.load(resp)
+    except ValueError as exc:
+        # A 200 carrying HTML -- a proxy's error page, a captive portal -- dies
+        # here, before the isinstance check below ever sees it. Unwrapped, it
+        # escapes as a bare JSONDecodeError that no `except GranolaError` catches.
+        raise GranolaError(0, f"{path} returned a body that is not JSON: {exc}") from exc
+    # A bare JSON array would otherwise fail much later, as an AttributeError
+    # inside a caller.
+    if not isinstance(payload, dict):
+        raise GranolaError(0, f"expected a JSON object from {path}, got {type(payload).__name__}")
+    return payload
+
+
+def _error_code(body: str, *, allow_substring: bool = True) -> str | None:
+    """The API's own error code, or None.
+
+    `allow_substring` gates the non-JSON fallback. A gateway's 502 page can
+    quote any string, including this one, and matching it there would convert a
+    retryable outage into a permanent TranscriptTooLarge that nothing retries.
+    """
     try:
         parsed = json.loads(body)
     except ValueError:
-        return "TRANSCRIPT_TOO_LARGE" if "TRANSCRIPT_TOO_LARGE" in body else None
+        if allow_substring and "TRANSCRIPT_TOO_LARGE" in body:
+            return "TRANSCRIPT_TOO_LARGE"
+        return None
     if isinstance(parsed, dict):
         for field in ("code", "error", "error_code", "message"):
             value = parsed.get(field)
@@ -205,8 +285,33 @@ def _error_code(body: str) -> str | None:
 
 
 def _retry_after(exc: urllib.error.HTTPError) -> float | None:
+    """Seconds from a Retry-After header, clamped, or None to use backoff.
+
+    `inf`, `nan` and negatives all parse and are all truthy, so without the
+    isfinite check they reach time.sleep and raise OverflowError or ValueError
+    from inside an exception handler. The ceiling matches the exponential path's:
+    an honest `Retry-After: 86400` would otherwise park a 15-minute poller for a
+    day.
+    """
     raw = exc.headers.get("Retry-After") if exc.headers else None
-    try:
-        return float(raw) if raw else None
-    except ValueError:
+    if not raw:
         return None
+    try:
+        seconds = float(raw)
+    except ValueError:
+        # The HTTP-date form is legal and unparsed here; backoff covers it.
+        return None
+    if not math.isfinite(seconds) or seconds < 0:
+        return None
+    return min(seconds, MAX_BACKOFF)
+
+
+def _path_segment(value: str) -> str:
+    """Percent-encode a caller-supplied path segment.
+
+    Note ids are the only caller-controlled part of any URL here. The https
+    assertion in _get catches a rewritten scheme; it does not catch a `?` or `#`,
+    which would silently turn the rest of the path into a query or fragment and
+    request a different note than the one asked for.
+    """
+    return urllib.parse.quote(value, safe="")

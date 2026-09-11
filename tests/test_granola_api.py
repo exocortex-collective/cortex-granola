@@ -1,10 +1,10 @@
 """Tests for the ported Granola API client.
 
-The module is a verbatim port that ran from cron for a week before it landed
-here, which is exactly the reason to test it rather than trust it: the sibling
-port, folders.py, carried two real bugs that review caught. Nothing here talks
-to the network -- urlopen is replaced, so the retry and rate-limit paths run in
-microseconds instead of the minutes their real sleeps would take.
+The module is a verbatim port, which is exactly the reason to test it rather
+than trust it: review of the same port found folders.py failing open on the deny
+list. Nothing here talks to the network -- urlopen is replaced and the clock is
+injected, so the retry and rate-limit paths run in microseconds instead of the
+minutes their real sleeps would take.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from __future__ import annotations
 import io
 import json
 import urllib.error
+import urllib.parse
 from email.message import Message
 from typing import Any
 
@@ -50,11 +51,18 @@ class FakeClock:
 
 
 @pytest.fixture
-def clock(monkeypatch: pytest.MonkeyPatch) -> FakeClock:
-    fake = FakeClock()
-    monkeypatch.setattr(api.time, "monotonic", fake.monotonic)
-    monkeypatch.setattr(api.time, "sleep", fake.sleep)
-    return fake
+def clock() -> FakeClock:
+    """A clock to hand to the client, NOT a patch of the time module.
+
+    `api.time` is the stdlib singleton: patching it redirects every sleep in the
+    process for the test's duration, so a background thread's sleep would append
+    to `clock.slept` and break the exact-sequence assertions nondeterministically.
+    """
+    return FakeClock()
+
+
+def client(clock: FakeClock, **kwargs: Any) -> GranolaClient:
+    return GranolaClient("grn_test", monotonic=clock.monotonic, sleep=clock.sleep, **kwargs)
 
 
 def http_error(
@@ -102,14 +110,14 @@ def respond_with(monkeypatch: pytest.MonkeyPatch, outcomes: list[Any]) -> list[s
 
 
 def test_token_bucket_spends_burst_without_sleeping(clock: FakeClock) -> None:
-    bucket = _TokenBucket(RATE_PER_SEC, BURST)
+    bucket = _TokenBucket(RATE_PER_SEC, BURST, monotonic=clock.monotonic, sleep=clock.sleep)
     for _ in range(BURST):
         bucket.take()
     assert clock.slept == []
 
 
 def test_token_bucket_sleeps_once_burst_is_exhausted(clock: FakeClock) -> None:
-    bucket = _TokenBucket(RATE_PER_SEC, BURST)
+    bucket = _TokenBucket(RATE_PER_SEC, BURST, monotonic=clock.monotonic, sleep=clock.sleep)
     for _ in range(BURST):
         bucket.take()
 
@@ -121,7 +129,7 @@ def test_token_bucket_sleeps_once_burst_is_exhausted(clock: FakeClock) -> None:
 
 
 def test_token_bucket_refills_over_elapsed_time(clock: FakeClock) -> None:
-    bucket = _TokenBucket(RATE_PER_SEC, BURST)
+    bucket = _TokenBucket(RATE_PER_SEC, BURST, monotonic=clock.monotonic, sleep=clock.sleep)
     for _ in range(BURST):
         bucket.take()
 
@@ -133,7 +141,7 @@ def test_token_bucket_refills_over_elapsed_time(clock: FakeClock) -> None:
 
 
 def test_token_bucket_refill_is_capped_at_burst(clock: FakeClock) -> None:
-    bucket = _TokenBucket(RATE_PER_SEC, BURST)
+    bucket = _TokenBucket(RATE_PER_SEC, BURST, monotonic=clock.monotonic, sleep=clock.sleep)
     clock.now += 3600.0  # an hour of credit must not become an hour of burst
 
     for _ in range(BURST):
@@ -149,9 +157,9 @@ def test_token_bucket_refill_is_capped_at_burst(clock: FakeClock) -> None:
 
 def test_retries_429_then_succeeds(clock: FakeClock, monkeypatch: pytest.MonkeyPatch) -> None:
     respond_with(monkeypatch, [http_error(429), {"ok": True}])
-    client = GranolaClient("grn_test")
+    api_client = client(clock)
 
-    assert client._get("/v1/notes") == {"ok": True}
+    assert api_client._get("/v1/notes") == {"ok": True}
     assert clock.slept == [1.0]  # 2**0
 
 
@@ -159,17 +167,17 @@ def test_retry_after_header_overrides_exponential_backoff(
     clock: FakeClock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     respond_with(monkeypatch, [http_error(429, headers={"Retry-After": "7"}), {"ok": True}])
-    client = GranolaClient("grn_test")
+    api_client = client(clock)
 
-    client._get("/v1/notes")
+    api_client._get("/v1/notes")
     assert clock.slept == [7.0]
 
 
 def test_backoff_grows_and_is_capped(clock: FakeClock, monkeypatch: pytest.MonkeyPatch) -> None:
     respond_with(monkeypatch, [http_error(503) for _ in range(8)] + [{"ok": True}])
-    client = GranolaClient("grn_test", max_retries=8)
+    api_client = client(clock, max_retries=8)
 
-    client._get("/v1/notes")
+    api_client._get("/v1/notes")
     # 2**n until the 60s ceiling, which is what keeps a long outage from
     # scheduling a multi-hour sleep inside a 15-minute poll.
     assert clock.slept == [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0]
@@ -177,10 +185,10 @@ def test_backoff_grows_and_is_capped(clock: FakeClock, monkeypatch: pytest.Monke
 
 def test_gives_up_after_max_retries(clock: FakeClock, monkeypatch: pytest.MonkeyPatch) -> None:
     respond_with(monkeypatch, [http_error(500) for _ in range(3)])
-    client = GranolaClient("grn_test", max_retries=2)
+    api_client = client(clock, max_retries=2)
 
     with pytest.raises(GranolaError) as caught:
-        client._get("/v1/notes")
+        api_client._get("/v1/notes")
     assert caught.value.status == 500
     assert len(clock.slept) == 2  # retried twice, then raised rather than looping
 
@@ -189,10 +197,10 @@ def test_4xx_other_than_429_does_not_retry(
     clock: FakeClock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     requested = respond_with(monkeypatch, [http_error(401, '{"error":"bad key"}')])
-    client = GranolaClient("grn_test")
+    api_client = client(clock)
 
     with pytest.raises(GranolaError) as caught:
-        client._get("/v1/notes")
+        api_client._get("/v1/notes")
     assert caught.value.status == 401
     assert caught.value.code == "bad key"
     assert len(requested) == 1  # a bad key is not going to fix itself
@@ -203,16 +211,30 @@ def test_network_error_retries_then_propagates(
     clock: FakeClock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     respond_with(monkeypatch, [urllib.error.URLError("no route") for _ in range(3)])
-    client = GranolaClient("grn_test", max_retries=2)
+    api_client = client(clock, max_retries=2)
 
     with pytest.raises(urllib.error.URLError):
-        client._get("/v1/notes")
+        api_client._get("/v1/notes")
     assert clock.slept == [1.0, 2.0]
 
 
 @pytest.mark.parametrize(
     ("raw", "expected"),
-    [("7", 7.0), ("0", 0.0), ("", None), ("Wed, 21 Oct 2026 07:28:00 GMT", None), (None, None)],
+    [
+        ("7", 7.0),
+        ("0", 0.0),
+        ("", None),
+        ("Wed, 21 Oct 2026 07:28:00 GMT", None),
+        (None, None),
+        # Each of these parses and is truthy, so before the isfinite/sign check
+        # they reached time.sleep and raised from inside an exception handler:
+        # OverflowError, ValueError, ValueError.
+        ("inf", None),
+        ("nan", None),
+        ("-5", None),
+        # An honest header must not park a 15-minute poller for a day.
+        ("86400", 60.0),
+    ],
 )
 def test_retry_after_parsing(raw: str | None, expected: float | None) -> None:
     headers = {"Retry-After": raw} if raw is not None else {}
@@ -236,18 +258,18 @@ def test_retry_after_zero_does_not_become_a_hot_loop(
     spin. This test is what would fail.
     """
     respond_with(monkeypatch, [http_error(429, headers={"Retry-After": "0"}), {"ok": True}])
-    client = GranolaClient("grn_test")
+    api_client = client(clock)
 
-    client._get("/v1/notes")
+    api_client._get("/v1/notes")
     assert clock.slept == [1.0]
 
 
 def test_413_raises_transcript_too_large(clock: FakeClock, monkeypatch: pytest.MonkeyPatch) -> None:
     requested = respond_with(monkeypatch, [http_error(413)])
-    client = GranolaClient("grn_test")
+    api_client = client(clock)
 
     with pytest.raises(TranscriptTooLarge):
-        client.get_note("not_1d3tmYTlCICgjy", include_transcript=True)
+        api_client.get_note("not_1d3tmYTlCICgjy", include_transcript=True)
     assert len(requested) == 1  # never retried: the transcript will not shrink
 
 
@@ -255,10 +277,10 @@ def test_error_code_in_body_raises_transcript_too_large(
     clock: FakeClock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     respond_with(monkeypatch, [http_error(400, '{"code":"TRANSCRIPT_TOO_LARGE"}')])
-    client = GranolaClient("grn_test")
+    api_client = client(clock)
 
     with pytest.raises(TranscriptTooLarge):
-        client.get_note("not_1d3tmYTlCICgjy", include_transcript=True)
+        api_client.get_note("not_1d3tmYTlCICgjy", include_transcript=True)
 
 
 def test_transcript_too_large_is_a_granola_error() -> None:
@@ -271,10 +293,10 @@ def test_non_json_body_still_detects_transcript_too_large(
     clock: FakeClock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     respond_with(monkeypatch, [http_error(400, "<html>TRANSCRIPT_TOO_LARGE</html>")])
-    client = GranolaClient("grn_test")
+    api_client = client(clock)
 
     with pytest.raises(TranscriptTooLarge):
-        client._get("/v1/notes/not_1d3tmYTlCICgjy")
+        api_client._get("/v1/notes/not_1d3tmYTlCICgjy")
 
 
 # -- pagination ------------------------------------------------------------
@@ -291,9 +313,9 @@ def test_paginate_follows_cursor_until_exhausted(
             {"notes": [{"id": "not_c"}], "hasMore": False, "cursor": None},
         ],
     )
-    client = GranolaClient("grn_test")
+    api_client = client(clock)
 
-    assert [n["id"] for n in client.list_notes()] == ["not_a", "not_b", "not_c"]
+    assert [n["id"] for n in api_client.list_notes()] == ["not_a", "not_b", "not_c"]
     assert "cursor=c1" in requested[1]
     assert "cursor=c2" in requested[2]
 
@@ -301,15 +323,19 @@ def test_paginate_follows_cursor_until_exhausted(
 def test_paginate_stops_when_cursor_is_null_despite_has_more(
     clock: FakeClock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The documented reason this condition is `or` and not `and`: the API has
-    # been seen echoing hasMore=true on a final page. Trusting it alone is an
-    # infinite loop re-requesting the same cursorless page forever.
+    # The `or` is defensive, not evidence-based: nothing in this repo, its
+    # history, or the Granola docs substantiates the inherited comment claiming
+    # the API "has been seen" echoing hasMore=true on a final page. Treat it as
+    # unverified. The guard is still worth keeping and worth testing, because
+    # trusting hasMore alone turns one bad page into an infinite loop
+    # re-requesting the same cursorless page forever -- a cheap guard against an
+    # unbounded failure.
     requested = respond_with(
         monkeypatch, [{"notes": [{"id": "not_a"}], "hasMore": True, "cursor": None}]
     )
-    client = GranolaClient("grn_test")
+    api_client = client(clock)
 
-    assert [n["id"] for n in client.list_notes()] == ["not_a"]
+    assert [n["id"] for n in api_client.list_notes()] == ["not_a"]
     assert len(requested) == 1
 
 
@@ -319,9 +345,9 @@ def test_paginate_stops_when_has_more_is_false_despite_cursor(
     requested = respond_with(
         monkeypatch, [{"notes": [{"id": "not_a"}], "hasMore": False, "cursor": "c1"}]
     )
-    client = GranolaClient("grn_test")
+    api_client = client(clock)
 
-    assert [n["id"] for n in client.list_notes()] == ["not_a"]
+    assert [n["id"] for n in api_client.list_notes()] == ["not_a"]
     assert len(requested) == 1
 
 
@@ -335,18 +361,18 @@ def test_paginate_tolerates_an_empty_page(
             {"notes": [{"id": "not_a"}], "hasMore": False, "cursor": None},
         ],
     )
-    client = GranolaClient("grn_test")
+    api_client = client(clock)
 
-    assert [n["id"] for n in client.list_notes()] == ["not_a"]
+    assert [n["id"] for n in api_client.list_notes()] == ["not_a"]
 
 
 def test_list_notes_passes_filters_and_omits_unset_ones(
     clock: FakeClock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     requested = respond_with(monkeypatch, [{"notes": [], "hasMore": False, "cursor": None}])
-    client = GranolaClient("grn_test")
+    api_client = client(clock)
 
-    list(client.list_notes(updated_after="2026-09-01T00:00:00Z", folder_id="fol_abc"))
+    list(api_client.list_notes(updated_after="2026-09-01T00:00:00Z", folder_id="fol_abc"))
 
     url = requested[0]
     assert "updated_after=2026-09-01T00%3A00%3A00Z" in url
@@ -360,18 +386,18 @@ def test_list_notes_passes_filters_and_omits_unset_ones(
 
 def test_non_object_response_is_an_error(clock: FakeClock, monkeypatch: pytest.MonkeyPatch) -> None:
     respond_with(monkeypatch, [["not", "an", "object"]])
-    client = GranolaClient("grn_test")
+    api_client = client(clock)
 
     with pytest.raises(GranolaError, match="expected a JSON object"):
-        client._get("/v1/notes")
+        api_client._get("/v1/notes")
 
 
 def test_non_list_collection_is_an_error(clock: FakeClock, monkeypatch: pytest.MonkeyPatch) -> None:
     respond_with(monkeypatch, [{"notes": "nope", "hasMore": False, "cursor": None}])
-    client = GranolaClient("grn_test")
+    api_client = client(clock)
 
     with pytest.raises(GranolaError, match="expected a list"):
-        list(client.list_notes())
+        list(api_client.list_notes())
 
 
 # -- the https guard -------------------------------------------------------
@@ -383,11 +409,11 @@ def test_rejects_a_note_id_that_escapes_the_base_url(
     # urlopen honours file://. A note id is the only caller-controlled part of
     # a path, so an id that rewrites the scheme would read local files.
     requested = respond_with(monkeypatch, [{"ok": True}])
-    client = GranolaClient("grn_test")
+    api_client = client(clock)
     monkeypatch.setattr(api, "BASE_URL", "file:///etc")
 
     with pytest.raises(GranolaError, match="non-https"):
-        client.get_note("passwd")
+        api_client.get_note("passwd")
     assert requested == []  # refused before the request went out
 
 
@@ -406,6 +432,173 @@ def test_authorization_header_carries_the_key(
         return FakeResponse(b"{}")
 
     monkeypatch.setattr(api.urllib.request, "urlopen", fake_urlopen)
-    GranolaClient("grn_secret")._get("/v1/notes")
+    GranolaClient("grn_secret", sleep=lambda _: None)._get("/v1/notes")
 
     assert captured[0]["Authorization"] == "Bearer grn_secret"
+
+
+# -- collection-key and body guards ----------------------------------------
+
+
+def test_a_missing_collection_key_is_an_error_not_an_empty_page(
+    clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The failure `or []` used to swallow, and the likelier one than a bad type.
+
+    A renamed or dropped key read as an empty page. The poll then reported
+    clean, and sync advances the watermark only on a clean poll -- so it would
+    step over every note in the window and nothing would rescan them.
+    """
+    respond_with(monkeypatch, [{"hasMore": False, "cursor": None}])
+    api_client = client(clock)
+
+    with pytest.raises(GranolaError, match="no 'notes' key"):
+        list(api_client.list_notes())
+
+
+def test_a_null_collection_is_an_empty_page(
+    clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Present-but-null is the API saying "none", unlike an absent key.
+    respond_with(monkeypatch, [{"notes": None, "hasMore": False, "cursor": None}])
+    assert list(client(clock).list_notes()) == []
+
+
+def test_a_non_dict_item_is_an_error(clock: FakeClock, monkeypatch: pytest.MonkeyPatch) -> None:
+    respond_with(
+        monkeypatch, [{"notes": [{"id": "not_a"}, "nope"], "hasMore": False, "cursor": None}]
+    )
+
+    with pytest.raises(GranolaError, match="expected objects"):
+        list(client(clock).list_notes())
+
+
+def test_a_200_carrying_html_is_a_granola_error(
+    clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A proxy error page dies in json.load, before the isinstance guard.
+
+    Unwrapped it escaped as a bare JSONDecodeError that no `except GranolaError`
+    catches -- the shape guard's comment claimed to cover exactly this case and
+    did not.
+    """
+
+    def fake_urlopen(req: Any, timeout: int | None = None) -> FakeResponse:
+        return FakeResponse(b"<html>502 Bad Gateway</html>")
+
+    monkeypatch.setattr(api.urllib.request, "urlopen", fake_urlopen)
+
+    with pytest.raises(GranolaError, match="not JSON"):
+        client(clock)._get("/v1/notes")
+
+
+def test_a_gateway_page_quoting_the_constant_is_retried_not_fatal(
+    clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_error_code's substring fallback ran on every status, and it is consulted
+    BEFORE the retryable branch -- so a 502 HTML page that happens to quote
+    TRANSCRIPT_TOO_LARGE was raised as a permanent failure and never retried."""
+    respond_with(
+        monkeypatch,
+        [
+            http_error(502, "<html>TRANSCRIPT_TOO_LARGE appears in this outage page</html>"),
+            {"ok": True},
+        ],
+    )
+
+    assert client(clock)._get("/v1/notes") == {"ok": True}
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ('{"code":"A","error":"B","error_code":"C","message":"D"}', "A"),
+        ('{"error":"B","message":"D"}', "B"),
+        ('{"error_code":"C","message":"D"}', "C"),
+        ('{"message":"D"}', "D"),
+        ('{"code":"","message":"D"}', "D"),
+        ('{"code":42,"message":"D"}', "D"),
+        ('["a","list"]', None),
+        ("null", None),
+    ],
+)
+def test_error_code_field_precedence(body: str, expected: str | None) -> None:
+    assert api._error_code(body) == expected
+
+
+# -- endpoints -------------------------------------------------------------
+
+
+def test_list_folders_requests_the_right_path_and_returns_every_page(
+    clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Untested, this would have failed silently: a wrong collection key yields
+    # an empty folder list, which reads as "no folders to exclude".
+    requested = respond_with(
+        monkeypatch,
+        [
+            {"folders": [{"id": "fol_a"}], "hasMore": True, "cursor": "c1"},
+            {"folders": [{"id": "fol_b"}], "hasMore": False, "cursor": None},
+        ],
+    )
+
+    assert [f["id"] for f in client(clock).list_folders()] == ["fol_a", "fol_b"]
+    assert "/v1/folders" in requested[0]
+    assert f"page_size={api.FOLDERS_PAGE_SIZE}" in requested[0]
+
+
+def test_get_transcript_pages_through_segments(
+    clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requested = respond_with(
+        monkeypatch,
+        [
+            {"transcript": [{"text": "one"}], "hasMore": True, "cursor": "c1"},
+            {"transcript": [{"text": "two"}], "hasMore": False, "cursor": None},
+        ],
+    )
+
+    segments = client(clock).get_transcript("not_1d3tmYTlCICgjy")
+    assert [s["text"] for s in segments] == ["one", "two"]
+    assert "/v1/notes/not_1d3tmYTlCICgjy/transcript" in requested[0]
+    assert f"page_size={api.TRANSCRIPT_PAGE_SIZE}" in requested[0]
+
+
+@pytest.mark.parametrize("note_id", ["not_a?x=1", "not_a#frag", "not_a/../folders", "not_a b"])
+def test_a_note_id_cannot_rewrite_the_request(
+    clock: FakeClock, monkeypatch: pytest.MonkeyPatch, note_id: str
+) -> None:
+    """The real exposure the scheme assertion does not cover.
+
+    BASE_URL is a constant prefix, so no id can change the scheme -- but an
+    unencoded `?` or `#` turns the rest of the path into a query or fragment,
+    and `..` walks to a different endpoint entirely. Each would request
+    something other than the note asked for.
+    """
+    requested = respond_with(monkeypatch, [{"ok": True}])
+    client(clock).get_note(note_id)
+
+    path = requested[0][len(api.BASE_URL) :]
+    # The id must stay ONE path segment. Asserting on the absence of ".." would
+    # be wrong: `not_a%2F..%2Ffolders` still contains literal dots, but with the
+    # slashes encoded there is nothing for them to traverse.
+    assert path.split("/") == ["", "v1", "notes", urllib.parse.quote(note_id, safe="")]
+
+
+def test_network_branch_is_not_satisfied_by_an_http_error(
+    clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """HTTPError subclasses URLError, so `pytest.raises(URLError)` in the
+    network test would still pass if the two handlers were merged. Pin the
+    distinction: a 500 must surface as GranolaError, not escape as a URLError."""
+    respond_with(monkeypatch, [http_error(500) for _ in range(2)])
+
+    with pytest.raises(GranolaError):
+        client(clock, max_retries=1)._get("/v1/notes")
+
+
+def test_a_negative_max_retries_is_rejected() -> None:
+    # Otherwise _get's loop body never runs and it falls through to an
+    # AssertionError("unreachable") that is neither.
+    with pytest.raises(ValueError, match="max_retries"):
+        GranolaClient("grn_test", max_retries=-1)

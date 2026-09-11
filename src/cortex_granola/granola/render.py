@@ -41,9 +41,20 @@ def note_date(note: JsonDict) -> dt.datetime:
     """Prefer the scheduled meeting time; fall back to now for a filename.
 
     The fallback exists because a file needs a name even when a note has no
-    timestamp. It must not reach the database -- see parse._meeting_date, which
-    stores NULL for exactly this case rather than a value that changes on every
-    re-parse.
+    timestamp.
+
+    It does NOT stay out of the database, and an earlier version of this
+    docstring said it did. parse._meeting_date is clean -- it calls
+    note_timestamp() and stores NULL for a timestamp-less note. But
+    relative_path() also feeds export._wanted_paths(), and export._record()
+    writes that %Y/%Y-%m-%d path into granola_exported_files.relative_path in
+    the same statement that sets written_at from the SERVER clock. Two clocks,
+    one row. Worse, export deletes by comparing old path to new, so a re-export
+    that crosses a client-clock UTC boundary unlinks the old file and walks the
+    note into a different directory while meeting_date stays NULL.
+
+    Tracked as Cortex-px6. Fixing it means export deciding the fallback, not
+    this function.
     """
     return note_timestamp(note) or dt.datetime.now(dt.UTC)
 
@@ -51,7 +62,11 @@ def note_date(note: JsonDict) -> dt.datetime:
 def relative_path(note: JsonDict) -> str:
     """Path within either output tree; both use the same shape."""
     when = note_date(note)
-    slug = slugify(note.get("title") or "untitled")
+    title = note.get("title")
+    # Export reads notes back out of JSONB, so api.py's ingest-time guards are
+    # not in the path. A non-string title reached unicodedata.normalize as-is
+    # and raised TypeError there.
+    slug = slugify(title if isinstance(title, str) and title else "untitled")
     # The note ID keeps the name stable and unique when two meetings on the
     # same day share a title.
     return f"{when:%Y}/{when:%Y-%m-%d}-{slug}-{note['id']}.md"
@@ -114,8 +129,8 @@ def _frontmatter(note: JsonDict, *, kind: str, extra: list[tuple[str, str]]) -> 
     created outside a meeting has neither start nor end.
     """
     event = note.get("calendar_event") or {}
-    folders = [f.get("name") for f in note.get("folder_membership") or [] if f.get("name")]
-    spaces = [s.get("name") for s in note.get("space_membership") or [] if s.get("name")]
+    folders = _member_names(note.get("folder_membership"))
+    spaces = _member_names(note.get("space_membership"))
     owner = note.get("owner") or {}
 
     lines: list[str] = [
@@ -144,12 +159,26 @@ def _frontmatter(note: JsonDict, *, kind: str, extra: list[tuple[str, str]]) -> 
     return "\n".join(lines)
 
 
-def _render_transcript(items: list[JsonDict]) -> str:
+def _render_transcript(items: object) -> str:
+    """Render transcript segments, skipping any that are malformed.
+
+    Typed `object`, not list[JsonDict]: the caller reads this straight from a
+    payload. Annotating it as a list of dicts is what let a non-dict segment
+    reach .strip() -- mypy believed the annotation and stopped checking.
+    """
+    if not isinstance(items, list):
+        return ""
     lines: list[str] = []
     last_speaker = None
     for item in items:
-        speaker = _speaker_label(item.get("speaker") or {})
-        text = (item.get("text") or "").strip()
+        if not isinstance(item, dict):
+            continue
+        raw_speaker = item.get("speaker")
+        speaker = _speaker_label(raw_speaker if isinstance(raw_speaker, dict) else {})
+        raw_text = item.get("text")
+        # A non-string here reached .strip() and raised AttributeError, taking
+        # the whole export down over one malformed segment.
+        text = raw_text.strip() if isinstance(raw_text, str) else ""
         if not text:
             continue
         if speaker != last_speaker:
@@ -204,22 +233,53 @@ def _attendee_lines(note: JsonDict) -> list[str]:
     return sorted(seen.values())
 
 
+def _member_names(members: object) -> list[str]:
+    """Names from a folder/space membership list, skipping anything malformed.
+
+    Typed `object` rather than list[JsonDict] because the caller reads it from a
+    payload: the annotation would be a claim, and this function's job is to stop
+    making that claim on the export path.
+    """
+    if not isinstance(members, list):
+        return []
+    names = []
+    for member in members:
+        if isinstance(member, dict):
+            name = member.get("name")
+            if isinstance(name, str) and name:
+                names.append(name)
+    return names
+
+
 def _yaml_list(key: str, values: list[str]) -> str:
     if not values:
         return f"{key}: []"
     return "\n".join([f"{key}:"] + [f"  - {_yaml_str(v)}" for v in values])
 
 
-def _yaml_str(value: str) -> str:
+def _yaml_str(value: object) -> str:
+    """Quote and escape a scalar for YAML. Accepts object: callers pass values
+    read from a payload, and the str() here was already doing the coercion the
+    old `value: str` annotation denied."""
     escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
     escaped = escaped.replace("\n", " ").replace("\r", " ")
     return f'"{escaped}"'
 
 
-def _parse_ts(value: str | None) -> dt.datetime | None:
-    if not value:
+def _parse_ts(value: object) -> dt.datetime | None:
+    """Parse an RFC3339 timestamp, preserving the offset as written.
+
+    Deliberately does NOT normalise to UTC: meeting_date is a DATE column and
+    the filename is a %Y-%m-%d, both taken from .date() on this result, so
+    converting here would move a note across a day boundary for any offset whose
+    local date differs from its UTC date.
+
+    Annotated `object` because callers pass raw payload values; the str() below
+    was already coercing whatever arrived.
+    """
+    if not value or not isinstance(value, str):
         return None
     try:
-        return dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
