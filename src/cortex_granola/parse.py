@@ -266,17 +266,18 @@ def _write_folders(
                 (
                     folder_id,
                     folder.get("name"),
-                    # NULL, and deliberately absent from the DO UPDATE above so
-                    # a re-parse cannot clobber a value someone else set.
+                    # Only ever an INSERT value, never an UPDATE one: the DO
+                    # UPDATE above omits parent_id on purpose. sync._sync_folders
+                    # writes the hierarchy from /v1/folders, which is the
+                    # authoritative source and also covers folders no ingested
+                    # note points at. A re-parse must not narrow that.
                     #
-                    # A note's folder_membership carries no parent: only
-                    # /v1/folders does, and nothing writes this table from that
-                    # endpoint yet. The earlier comment here claimed "the
-                    # deny-list walk rebuilds the tree from the API anyway" --
-                    # it does not. folders.py reads the tree into memory for
-                    # deny resolution and never persists it, so the hierarchy is
-                    # simply not populated. Tracked as Cortex-b4o.12.
-                    None,
+                    # Membership entries do carry parent_folder_id -- measured,
+                    # 122 of 122 in this workspace -- so it seeds the row when
+                    # parse happens to get there first. The FK is self-
+                    # referencing, so a parent this note has never seen is
+                    # stored as NULL for sync to correct.
+                    _membership_parent(folder, memberships),
                     space_id,
                     spaces.get(space_id),
                 ),
@@ -286,3 +287,18 @@ def _write_folders(
                 "ON CONFLICT DO NOTHING",
                 (granola_id, folder_id),
             )
+
+
+def _membership_parent(folder: dict[str, Any], memberships: list[dict[str, Any]]) -> str | None:
+    """The folder's parent, if this payload also names the parent as a folder.
+
+    granola_folders.parent_id references granola_folders, so pointing at a
+    folder no row exists for yet would fail the insert. Membership lists only
+    the folders a note belongs to, which need not include an ancestor, so the
+    parent is kept only when it is present in the same payload.
+    """
+    parent_id = folder.get("parent_folder_id")
+    if not parent_id:
+        return None
+    known = {other.get("id") for other in memberships}
+    return str(parent_id) if parent_id in known else None

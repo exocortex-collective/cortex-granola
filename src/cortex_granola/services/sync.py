@@ -198,14 +198,19 @@ class GranolaSync:
 
     # -- adapters ----------------------------------------------------------
 
-    def _denied_note_ids(self) -> set[str]:
-        """Note ids excluded by the folder/space deny list.
+    def _sync_folders(self, conn: psycopg2.extensions.connection) -> set[str]:
+        """Persist the folder tree from /v1/folders, and return the denied notes.
 
-        Resolved before any content fetch, so an excluded note's summary and
-        transcript are never downloaded.
+        /v1/folders is the only authoritative source for the hierarchy and for
+        folders nobody has filed a note in yet. Letting parse.py be the sole
+        writer meant `granola_folders` held only folders reachable from an
+        INGESTED note -- measured here as 13 of 17, missing the three the deny
+        list excludes and one that is merely empty. That made the `excluded`
+        column dead by construction: a denied folder never got a row to flag.
+
+        Folders are fetched once and used for both jobs, so persisting the tree
+        costs no extra API call.
         """
-        if not (self.config.deny_folders or self.config.deny_spaces):
-            return set()
         folders = self.client.list_folders()
         resolution = resolve_deny_list(folders, self.config.deny_folders, self.config.deny_spaces)
         # resolve_deny_list already logs unmatched terms; this is the operator
@@ -217,7 +222,58 @@ class GranolaSync:
             matched_spaces=list(resolution.matched_space_names),
             unmatched=list(resolution.unmatched),
         )
+        self._store_folders(conn, folders, resolution.folder_ids)
+
+        if not (self.config.deny_folders or self.config.deny_spaces):
+            return set()
         return collect_denied_note_ids(self.client, resolution.folder_ids)
+
+    @staticmethod
+    def _store_folders(
+        conn: psycopg2.extensions.connection,
+        folders: list[dict[str, Any]],
+        excluded_ids: frozenset[str],
+    ) -> None:
+        """Upsert every folder the API reports, hierarchy included.
+
+        Ordered parents-first so the self-referencing parent_id FK is satisfied
+        on a first run. A parent the API did not return would still violate it,
+        so an unresolvable parent is stored as NULL rather than failing the
+        whole poll over one folder's missing ancestor.
+        """
+        known = {f.get("id") for f in folders if f.get("id")}
+        with conn.cursor() as cur:
+            for folder in _parents_first(folders):
+                folder_id = folder.get("id")
+                if not folder_id:
+                    continue
+                parent_id = folder.get("parent_folder_id")
+                if parent_id not in known:
+                    parent_id = None
+                cur.execute(
+                    """
+                    INSERT INTO granola_folders
+                        (folder_id, name, parent_id, space_id, excluded)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (folder_id) DO UPDATE
+                       SET name = EXCLUDED.name,
+                           parent_id = EXCLUDED.parent_id,
+                           space_id = EXCLUDED.space_id,
+                           excluded = EXCLUDED.excluded,
+                           updated_at = NOW()
+                    """,
+                    (
+                        folder_id,
+                        folder.get("name") or "",
+                        parent_id,
+                        folder.get("space_id"),
+                        folder_id in excluded_ids,
+                    ),
+                )
+        # space_name is deliberately not written here: /v1/folders carries a
+        # space_id but no space name. parse.py fills it from a note's
+        # space_membership, and overwriting it with NULL on every poll would
+        # undo that.
 
     def poll(self) -> PollStats:
         """One incremental pass. Safe to run on any cadence, including overlapping."""
@@ -233,7 +289,7 @@ class GranolaSync:
             # laptop and would not survive a move.
             scan_started = self._server_now(conn)
             since = self._window_start(conn)
-            denied = self._denied_note_ids()
+            denied = self._sync_folders(conn)
             log.info("granola poll starting", since=since, denied=len(denied))
 
             for summary in self.client.list_notes(updated_after=since):
@@ -406,10 +462,10 @@ class GranolaSync:
         a historical scan must not delay today's meeting notes.
         """
         stats = PollStats()
-        denied = self._denied_note_ids()
         log.info("granola backfill starting", job_id=job_id, after=after, before=before)
 
         with self._conn() as conn:
+            denied = self._sync_folders(conn)
             listing = self.client.list_notes(
                 created_after=after.isoformat() if after else None,
                 created_before=before.isoformat() if before else None,
@@ -504,3 +560,38 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def _parents_first(folders: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Folders ordered so a parent is always inserted before its children.
+
+    granola_folders.parent_id references the same table, so a child inserted
+    first violates the FK on a fresh database. Granola's folders are one level
+    deep today, which is exactly why this is easy to get wrong and not notice.
+
+    A cycle -- which the API should never produce -- would otherwise spin here,
+    so anything still unplaced after a pass with no progress is appended as-is
+    and lets _store_folders null its parent out.
+    """
+    by_id = {f["id"]: f for f in folders if f.get("id")}
+    ordered: list[dict[str, Any]] = []
+    placed: set[str] = set()
+    pending = list(by_id.values())
+
+    while pending:
+        progressed = False
+        remaining: list[dict[str, Any]] = []
+        for folder in pending:
+            parent = folder.get("parent_folder_id")
+            if parent is None or parent in placed or parent not in by_id:
+                ordered.append(folder)
+                placed.add(folder["id"])
+                progressed = True
+            else:
+                remaining.append(folder)
+        if not progressed:
+            ordered.extend(remaining)
+            break
+        pending = remaining
+
+    return ordered
