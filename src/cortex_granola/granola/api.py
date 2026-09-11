@@ -135,8 +135,7 @@ class GranolaClient:
                 ) as resp:
                     return _decode(resp, path)
             except urllib.error.HTTPError as exc:
-                with exc:
-                    body = exc.read().decode("utf-8", "replace")
+                body = _error_body(exc)
                 code = _error_code(body, allow_substring=exc.code in (400, 413))
                 if exc.code == 413 or code == "TRANSCRIPT_TOO_LARGE":
                     raise TranscriptTooLarge(exc.code, body, code) from exc
@@ -261,6 +260,22 @@ def _decode(resp: Any, path: str) -> JsonDict:
     if not isinstance(payload, dict):
         raise GranolaError(0, f"expected a JSON object from {path}, got {type(payload).__name__}")
     return payload
+
+
+def _error_body(exc: urllib.error.HTTPError) -> str:
+    """The error response body, or "" if reading it fails.
+
+    The body arrives over the same socket that just failed, so read() can raise
+    -- and an exception escaping here would replace a retryable 429/503 with an
+    unrelated OSError that skips the retry path entirely. The status is the part
+    that decides control flow; the body is only ever diagnostic.
+    """
+    try:
+        with exc:
+            return exc.read().decode("utf-8", "replace")
+    except OSError as read_error:
+        log.warning("could not read error body for HTTP %s: %s", exc.code, read_error)
+        return ""
 
 
 def _error_code(body: str, *, allow_substring: bool = True) -> str | None:
