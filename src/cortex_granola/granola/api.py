@@ -8,6 +8,7 @@ it.
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import math
@@ -16,7 +17,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterator, Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from _typeshed import SupportsRead
 
 log = logging.getLogger(__name__)
 
@@ -151,6 +155,22 @@ class GranolaClient:
                 delay = min(MAX_BACKOFF, 2.0**attempt)
                 log.warning("network error on %s (%s); retrying in %.1fs", path, exc.reason, delay)
                 self._sleep(delay)
+            except (http.client.HTTPException, TimeoutError) as exc:
+                # Raised while READING the body, after the response headers
+                # arrived. http.client.IncompleteRead is HTTPException-derived,
+                # not OSError, and urllib only wraps connect-phase failures in
+                # URLError -- so neither handler above sees either of these, and
+                # both escaped _get entirely. Transient, so they retry.
+                if attempt == self._max_retries:
+                    raise GranolaError(0, f"{path}: {type(exc).__name__}: {exc}") from exc
+                delay = min(MAX_BACKOFF, 2.0**attempt)
+                log.warning(
+                    "body read failed on %s (%s); retrying in %.1fs",
+                    path,
+                    type(exc).__name__,
+                    delay,
+                )
+                self._sleep(delay)
 
         raise AssertionError("unreachable")
 
@@ -240,13 +260,14 @@ def _build_url(path: str, params: QueryParams | None) -> str:
     return url
 
 
-def _decode(resp: Any, path: str) -> JsonDict:
+def _decode(resp: SupportsRead[bytes | str], path: str) -> JsonDict:
     """The response body as a JSON object, or a GranolaError explaining why not.
 
-    `resp` is Any because json.load's stub is typed against _typeshed's private
-    SupportsRead, which has no runtime home. Restating that protocol here would
-    trade one honest Any for an unused `length` parameter that vulture correctly
-    reports as dead.
+    `resp` uses json.load's own parameter protocol, imported under TYPE_CHECKING
+    because _typeshed has no runtime module. Restating the protocol locally
+    instead would introduce an unused `length` parameter that vulture reports as
+    dead at 100% confidence, and this repo's whitelist forbids suppressing a
+    finding that is correct.
     """
     try:
         payload = json.load(resp)
@@ -267,23 +288,29 @@ def _error_body(exc: urllib.error.HTTPError) -> str:
 
     The body arrives over the same socket that just failed, so read() can raise
     -- and an exception escaping here would replace a retryable 429/503 with an
-    unrelated OSError that skips the retry path entirely. The status is the part
+    unrelated error that skips the retry path entirely. The status is the part
     that decides control flow; the body is only ever diagnostic.
+
+    HTTPException is caught alongside OSError because http.client.IncompleteRead
+    -- what HTTPResponse.read() actually raises on a truncated body, and the
+    likeliest failure here -- derives from HTTPException and is NOT an OSError.
     """
     try:
         with exc:
             return exc.read().decode("utf-8", "replace")
-    except OSError as read_error:
+    except (OSError, http.client.HTTPException) as read_error:
         log.warning("could not read error body for HTTP %s: %s", exc.code, read_error)
         return ""
 
 
-def _error_code(body: str, *, allow_substring: bool = True) -> str | None:
+def _error_code(body: str, *, allow_substring: bool) -> str | None:
     """The API's own error code, or None.
 
-    `allow_substring` gates the non-JSON fallback. A gateway's 502 page can
-    quote any string, including this one, and matching it there would convert a
-    retryable outage into a permanent TranscriptTooLarge that nothing retries.
+    `allow_substring` gates the non-JSON fallback and has no default on
+    purpose. A gateway's 502 page can quote any string, including this one, and
+    matching it there converts a retryable outage into a permanent
+    TranscriptTooLarge that nothing retries -- so every caller states which it
+    wants.
     """
     try:
         parsed = json.loads(body)

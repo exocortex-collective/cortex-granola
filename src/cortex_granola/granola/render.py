@@ -16,6 +16,23 @@ from cortex_granola.granola.api import JsonDict
 
 MAX_SLUG = 60
 
+
+class MalformedNote(ValueError):
+    """A note payload whose shape makes a faithful rendering impossible.
+
+    The rule this file follows, and the reason this exists: an ABSENT field is
+    ordinary -- the API documents nullable titles, and a note can have no
+    folders -- and gets a documented fallback. A field of the WRONG TYPE is a
+    payload nobody can render honestly, and it must stop the export.
+
+    Silently dropping it is the one thing that must not happen. render is
+    upstream of export._record, which upserts whatever it is handed with
+    written_at = NOW(); a header-only document written over a good file reports
+    success while destroying the content it replaced. The crash this class
+    replaces was ugly but safe, because it left the old file and a traceback.
+    """
+
+
 # Speaker source when nothing better identifies who was talking. `microphone`
 # is the note-taker's own audio stream; `speaker` is everyone else's.
 _SOURCE_LABELS = {"microphone": "Me", "speaker": "Them"}
@@ -62,11 +79,7 @@ def note_date(note: JsonDict) -> dt.datetime:
 def relative_path(note: JsonDict) -> str:
     """Path within either output tree; both use the same shape."""
     when = note_date(note)
-    title = note.get("title")
-    # Export reads notes back out of JSONB, so api.py's ingest-time guards are
-    # not in the path. A non-string title reached unicodedata.normalize as-is
-    # and raised TypeError there.
-    slug = slugify(title if isinstance(title, str) and title else "untitled")
+    slug = slugify(_text(note, "title") or "untitled")
     # The note ID keeps the name stable and unique when two meetings on the
     # same day share a title.
     return f"{when:%Y}/{when:%Y-%m-%d}-{slug}-{note['id']}.md"
@@ -129,8 +142,8 @@ def _frontmatter(note: JsonDict, *, kind: str, extra: list[tuple[str, str]]) -> 
     created outside a meeting has neither start nor end.
     """
     event = note.get("calendar_event") or {}
-    folders = _member_names(note.get("folder_membership"))
-    spaces = _member_names(note.get("space_membership"))
+    folders = _member_names(note.get("folder_membership"), "folder_membership")
+    spaces = _member_names(note.get("space_membership"), "space_membership")
     owner = note.get("owner") or {}
 
     lines: list[str] = [
@@ -160,25 +173,40 @@ def _frontmatter(note: JsonDict, *, kind: str, extra: list[tuple[str, str]]) -> 
 
 
 def _render_transcript(items: object) -> str:
-    """Render transcript segments, skipping any that are malformed.
+    """Render transcript segments, or raise if the payload is not renderable.
 
     Typed `object`, not list[JsonDict]: the caller reads this straight from a
     payload. Annotating it as a list of dicts is what let a non-dict segment
     reach .strip() -- mypy believed the annotation and stopped checking.
+
+    A missing or empty text field skips that segment, which is ordinary. A
+    wrong-TYPED one raises: returning "" here would hand export a header-only
+    transcript to write over a complete one.
     """
-    if not isinstance(items, list):
+    if items is None:
         return ""
+    if not isinstance(items, list):
+        raise MalformedNote(f"transcript must be a list, got {type(items).__name__}")
     lines: list[str] = []
     last_speaker = None
-    for item in items:
+    for index, item in enumerate(items):
         if not isinstance(item, dict):
-            continue
+            raise MalformedNote(
+                f"transcript segment {index} must be an object, got {type(item).__name__}"
+            )
         raw_speaker = item.get("speaker")
-        speaker = _speaker_label(raw_speaker if isinstance(raw_speaker, dict) else {})
+        if raw_speaker is not None and not isinstance(raw_speaker, dict):
+            raise MalformedNote(
+                f"transcript segment {index} speaker must be an object, "
+                f"got {type(raw_speaker).__name__}"
+            )
+        speaker = _speaker_label(raw_speaker or {})
         raw_text = item.get("text")
-        # A non-string here reached .strip() and raised AttributeError, taking
-        # the whole export down over one malformed segment.
-        text = raw_text.strip() if isinstance(raw_text, str) else ""
+        if raw_text is not None and not isinstance(raw_text, str):
+            raise MalformedNote(
+                f"transcript segment {index} text must be a string, got {type(raw_text).__name__}"
+            )
+        text = (raw_text or "").strip()
         if not text:
             continue
         if speaker != last_speaker:
@@ -233,22 +261,45 @@ def _attendee_lines(note: JsonDict) -> list[str]:
     return sorted(seen.values())
 
 
-def _member_names(members: object) -> list[str]:
-    """Names from a folder/space membership list, skipping anything malformed.
+def _member_names(members: object, field: str) -> list[str]:
+    """Names from a folder/space membership list, or raise if it is not one.
 
     Typed `object` rather than list[JsonDict] because the caller reads it from a
     payload: the annotation would be a claim, and this function's job is to stop
     making that claim on the export path.
+
+    A member with no name is skipped -- that is a real shape. A non-list, or a
+    member that is not an object, raises: dropping folders silently would write
+    a note into the vault with its exclusion metadata quietly missing.
     """
-    if not isinstance(members, list):
+    if members is None:
         return []
+    if not isinstance(members, list):
+        raise MalformedNote(f"{field} must be a list, got {type(members).__name__}")
     names = []
-    for member in members:
-        if isinstance(member, dict):
-            name = member.get("name")
-            if isinstance(name, str) and name:
-                names.append(name)
+    for index, member in enumerate(members):
+        if not isinstance(member, dict):
+            raise MalformedNote(f"{field}[{index}] must be an object, got {type(member).__name__}")
+        name = member.get("name")
+        if name is None:
+            continue
+        if not isinstance(name, str):
+            raise MalformedNote(
+                f"{field}[{index}].name must be a string, got {type(name).__name__}"
+            )
+        if name:
+            names.append(name)
     return names
+
+
+def _text(note: JsonDict, field: str) -> str | None:
+    """A string field from a payload: None when absent, raise when wrong-typed."""
+    value = note.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise MalformedNote(f"{field} must be a string, got {type(value).__name__}")
+    return value
 
 
 def _yaml_list(key: str, values: list[str]) -> str:
@@ -269,8 +320,9 @@ def _yaml_str(value: object) -> str:
 def _parse_ts(value: object) -> dt.datetime | None:
     """Parse an RFC3339 timestamp, preserving the offset as written.
 
-    Deliberately does NOT normalise to UTC: meeting_date is a DATE column and
-    the filename is a %Y-%m-%d, both taken from .date() on this result, so
+    Deliberately does NOT normalise to UTC. meeting_date is a DATE column filled
+    from .date() on this result (parse.py), and the filename is a %Y-%m-%d
+    strftime of it (relative_path) -- different mechanisms, same exposure:
     converting here would move a note across a day boundary for any offset whose
     local date differs from its UTC date.
 

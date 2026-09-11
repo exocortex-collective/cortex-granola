@@ -9,6 +9,7 @@ minutes their real sleeps would take.
 
 from __future__ import annotations
 
+import http.client
 import io
 import json
 import urllib.error
@@ -77,7 +78,20 @@ def http_error(
 
 
 class FakeResponse(io.BytesIO):
-    """urlopen's context manager over a canned JSON body."""
+    """urlopen's context manager over a canned JSON body.
+
+    `raises` makes read() fail the way a truncated or stalled socket does, which
+    is the only way to exercise the body-read branches.
+    """
+
+    def __init__(self, body: bytes, raises: BaseException | None = None) -> None:
+        super().__init__(body)
+        self._raises = raises
+
+    def read(self, *args: object) -> bytes:
+        if self._raises is not None:
+            raise self._raises
+        return super().read()
 
     def __enter__(self) -> FakeResponse:
         return self
@@ -523,7 +537,7 @@ def test_a_gateway_page_quoting_the_constant_is_retried_not_fatal(
     ],
 )
 def test_error_code_field_precedence(body: str, expected: str | None) -> None:
-    assert api._error_code(body) == expected
+    assert api._error_code(body, allow_substring=False) == expected
 
 
 # -- endpoints -------------------------------------------------------------
@@ -602,3 +616,135 @@ def test_a_negative_max_retries_is_rejected() -> None:
     # AssertionError("unreachable") that is neither.
     with pytest.raises(ValueError, match="max_retries"):
         GranolaClient("grn_test", max_retries=-1)
+
+
+# -- the cursor type guard -------------------------------------------------
+
+
+@pytest.mark.parametrize("bad_cursor", [42, {"c": 1}, ["c"], True])
+def test_a_non_string_cursor_ends_pagination(
+    clock: FakeClock, monkeypatch: pytest.MonkeyPatch, bad_cursor: object
+) -> None:
+    """The isinstance arm of the cursor coercion, which nothing exercised.
+
+    Every other pagination test supplies `"cursor": None`, which the pre-PR
+    `if not cursor` already handled -- so deleting the isinstance check left the
+    whole suite green. A non-string cursor going back into urlencode would
+    request a page the API cannot parse, on a loop.
+    """
+    requested = respond_with(
+        monkeypatch,
+        [
+            {"notes": [{"id": "not_a"}], "hasMore": True, "cursor": bad_cursor},
+            {"notes": [{"id": "not_b"}], "hasMore": False, "cursor": None},
+        ],
+    )
+
+    assert [n["id"] for n in client(clock).list_notes()] == ["not_a"]
+    assert len(requested) == 1
+
+
+def test_an_empty_string_cursor_ends_pagination(
+    clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requested = respond_with(
+        monkeypatch, [{"notes": [{"id": "not_a"}], "hasMore": True, "cursor": ""}]
+    )
+
+    assert [n["id"] for n in client(clock).list_notes()] == ["not_a"]
+    assert len(requested) == 1
+
+
+# -- reading the error body ------------------------------------------------
+
+
+class ExplodingBody(io.BytesIO):
+    """A response body whose read() fails, as a socket that just died would."""
+
+    def __init__(self, error: BaseException) -> None:
+        super().__init__(b"")
+        self._error = error
+
+    def read(self, *args: object) -> bytes:
+        raise self._error
+
+
+def exploding_http_error(
+    status: int, error: BaseException, headers: dict[str, str]
+) -> urllib.error.HTTPError:
+    message = Message()
+    for key, value in headers.items():
+        message[key] = value
+    return urllib.error.HTTPError(
+        "https://public-api.granola.ai/v1/notes", status, "err", message, ExplodingBody(error)
+    )
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        http.client.IncompleteRead(b"partial"),
+        ConnectionResetError("connection reset"),
+        TimeoutError("timed out"),
+    ],
+)
+def test_a_failing_error_body_read_does_not_defeat_the_retry(
+    clock: FakeClock, monkeypatch: pytest.MonkeyPatch, error: BaseException
+) -> None:
+    """_error_body's whole reason to exist, previously untested.
+
+    The body arrives over the socket that just failed. An exception escaping the
+    read replaced a retryable 503 with an unrelated error that skipped the retry
+    branch entirely -- so the poller gave up on a transient outage.
+
+    IncompleteRead is the case the first version of the guard missed: it derives
+    from http.client.HTTPException, not OSError.
+    """
+    respond_with(
+        monkeypatch, [exploding_http_error(503, error, {"Retry-After": "1"}), {"ok": True}]
+    )
+
+    assert client(clock)._get("/v1/notes") == {"ok": True}
+    assert clock.slept == [1.0]
+
+
+# -- body-read failures on the success path --------------------------------
+
+
+@pytest.mark.parametrize(
+    "error", [http.client.IncompleteRead(b"partial"), TimeoutError("read timed out")]
+)
+def test_a_truncated_success_body_is_retried(
+    clock: FakeClock, monkeypatch: pytest.MonkeyPatch, error: BaseException
+) -> None:
+    """Neither of these is a URLError, and neither is a ValueError.
+
+    So both escaped _get's handlers entirely on the success path -- unretried
+    and outside the client's error taxonomy, while _decode's docstring promised
+    a GranolaError explaining why not. urllib wraps connect-phase failures in
+    URLError; a stalled or truncated BODY read happens after that.
+    """
+    remaining: list[object] = [error, {"ok": True}]
+
+    def fake_urlopen(req: Any, timeout: int | None = None) -> FakeResponse:
+        outcome = remaining.pop(0)
+        if isinstance(outcome, BaseException):
+            return FakeResponse(b"", raises=outcome)
+        return FakeResponse(json.dumps(outcome).encode())
+
+    monkeypatch.setattr(api.urllib.request, "urlopen", fake_urlopen)
+
+    assert client(clock)._get("/v1/notes") == {"ok": True}
+    assert clock.slept == [1.0]
+
+
+def test_a_persistent_body_read_failure_becomes_a_granola_error(
+    clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_urlopen(req: Any, timeout: int | None = None) -> FakeResponse:
+        return FakeResponse(b"", raises=http.client.IncompleteRead(b"partial"))
+
+    monkeypatch.setattr(api.urllib.request, "urlopen", fake_urlopen)
+
+    with pytest.raises(GranolaError, match="IncompleteRead"):
+        client(clock, max_retries=1)._get("/v1/notes")

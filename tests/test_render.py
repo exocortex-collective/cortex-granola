@@ -15,6 +15,7 @@ import pytest
 
 from cortex_granola.granola.render import (
     MAX_SLUG,
+    MalformedNote,
     _attendee_lines,
     _parse_ts,
     _speaker_label,
@@ -177,8 +178,9 @@ def test_parse_ts(raw: object, expected: dt.datetime | None) -> None:
 def test_parse_ts_preserves_the_offset_as_written() -> None:
     """The offset must survive, because .date() is taken from this result.
 
-    meeting_date is a DATE column and the filename is a %Y-%m-%d, both from
-    .date() on what this returns. An earlier version asserted through
+    meeting_date is a DATE column filled from .date() on what this returns, and
+    the filename is a %Y-%m-%d strftime of the same value. An earlier version
+    asserted through
     .astimezone(UTC), which is a no-op for equality between aware datetimes and
     normalised away the one property under test -- so a trailing
     .astimezone(dt.UTC) inside _parse_ts would have gone unnoticed while moving
@@ -415,15 +417,40 @@ def test_frontmatter_renders_populated_lists() -> None:
     assert 'spaces:\n  - "Valid Eval team"' in rendered
 
 
-def test_frontmatter_skips_malformed_membership_entries() -> None:
-    # Export reads these back from JSONB, where nothing guarantees the shape.
+def test_frontmatter_skips_members_with_no_name() -> None:
+    # A member without a name is a real shape, not a malformed one.
     rendered = render_note(
-        note(folder_membership=["not a dict", {"id": "fol_x"}, {"name": 42}, {"name": "Real"}]),
+        note(folder_membership=[{"id": "fol_x"}, {"name": None}, {"name": "Real"}]),
         include_private_notes=False,
         transcript_link=None,
     )
     assert 'folders:\n  - "Real"' in rendered
-    assert "42" not in rendered
+
+
+@pytest.mark.parametrize(
+    "membership",
+    [42, "a string", {"not": "a list"}, ["not a dict"], [{"name": 42}], [{"name": ["x"]}]],
+)
+def test_frontmatter_rejects_malformed_membership(membership: object) -> None:
+    """Wrong-typed membership must stop the export, not quietly vanish.
+
+    Dropping it silently would write the note into the vault with its folder
+    metadata missing -- and since the deny list is expressed in folders, a note
+    whose folders disappeared is exactly the note that must not be written.
+    """
+    with pytest.raises(MalformedNote, match="folder_membership"):
+        render_note(
+            note(folder_membership=membership), include_private_notes=False, transcript_link=None
+        )
+
+
+def test_frontmatter_accepts_absent_membership() -> None:
+    rendered = render_note(
+        note(folder_membership=None, space_membership=None),
+        include_private_notes=False,
+        transcript_link=None,
+    )
+    assert "folders: []" in rendered
 
 
 def test_render_note_includes_web_url_when_present() -> None:
@@ -440,25 +467,69 @@ def test_render_note_omits_web_url_when_absent() -> None:
     assert "web_url:" not in rendered
 
 
-@pytest.mark.parametrize("bad_title", [None, 42, {"nested": "dict"}, ""])
-def test_relative_path_survives_a_non_string_title(bad_title: object) -> None:
-    """A title straight out of JSONB reached unicodedata.normalize and raised
-    TypeError there, taking down the export of one note."""
-    assert relative_path(note(title=bad_title)).endswith("untitled-not_1d3tmYTlCICgjy.md")
+@pytest.mark.parametrize("absent_title", [None, ""])
+def test_relative_path_falls_back_to_untitled_for_an_absent_title(absent_title: object) -> None:
+    # The API documents title as nullable, so absence is ordinary.
+    assert relative_path(note(title=absent_title)).endswith("untitled-not_1d3tmYTlCICgjy.md")
+
+
+@pytest.mark.parametrize("bad_title", [42, {"nested": "dict"}, ["list"], 3.5])
+def test_relative_path_rejects_a_wrong_typed_title(bad_title: object) -> None:
+    """A non-string title reached unicodedata.normalize and raised TypeError.
+
+    It now raises MalformedNote instead -- but it must still RAISE. Falling back
+    to "untitled" would file the note at a path derived from nothing, and the
+    export worker deletes by previously-rendered path.
+    """
+    with pytest.raises(MalformedNote, match="title"):
+        relative_path(note(title=bad_title))
 
 
 @pytest.mark.parametrize(
-    "segments",
+    ("segments", "expected"),
     [
-        ["not a dict"],
-        [{"text": 42, "speaker": {"source": "microphone"}}],
-        [{"text": "ok", "speaker": "not a dict"}],
-        "not a list",
+        ("not a list", "transcript must be a list"),
+        (42, "transcript must be a list"),
+        ({"not": "a list"}, "transcript must be a list"),
+        (["not a dict"], "segment 0 must be an object"),
+        ([{"text": 42, "speaker": {"source": "microphone"}}], "segment 0 text must be a string"),
+        ([{"text": "ok", "speaker": "not a dict"}], "segment 0 speaker must be an object"),
+        ([{"text": "fine"}, {"text": ["bad"]}], "segment 1 text must be a string"),
     ],
 )
-def test_render_transcript_survives_malformed_segments(segments: object) -> None:
-    # Previously AttributeError: 'dict' object has no attribute 'strip'.
-    render_transcript(note(transcript=segments), note_link="../../n/x.md")
+def test_render_transcript_rejects_malformed_segments(segments: object, expected: str) -> None:
+    """Malformed transcript data must stop the export, not shorten the file.
+
+    An earlier version of this guard returned "" or skipped the segment. That
+    is worse than the AttributeError it replaced: render is upstream of
+    export._record, which upserts whatever it is given with written_at = NOW(),
+    so a header-only transcript reports success while overwriting a complete
+    one. The crash at least left the old file intact.
+    """
+    with pytest.raises(MalformedNote, match=expected):
+        render_transcript(note(transcript=segments), note_link="../../n/x.md")
+
+
+@pytest.mark.parametrize(
+    "segment", [{"speaker": {"source": "microphone"}}, {"text": None}, {"text": "  "}]
+)
+def test_render_transcript_skips_segments_with_no_text(segment: dict[str, Any]) -> None:
+    # Absent text is ordinary; only a wrong TYPE is fatal.
+    rendered = render_transcript(note(transcript=[segment]), note_link="../../n/x.md")
+    assert "transcript" in rendered
+
+
+def test_render_transcript_keeps_the_line_when_one_speaker_record_is_absent() -> None:
+    """A segment with no speaker must still contribute its text.
+
+    Guarding by skipping the segment would cost a line of transcript over a
+    missing label -- and a test that only asserts "no crash" passes when it does.
+    """
+    rendered = render_transcript(
+        note(transcript=[{"text": "Said something.", "speaker": None}]),
+        note_link="../../n/x.md",
+    )
+    assert "Said something." in rendered
 
 
 def test_both_documents_carry_the_granola_id_and_their_kind() -> None:
@@ -467,3 +538,72 @@ def test_both_documents_carry_the_granola_id_and_their_kind() -> None:
     for doc, kind in ((summary, "summary"), (transcript, "transcript")):
         assert "granola_id: not_1d3tmYTlCICgjy" in doc
         assert f"kind: {kind}" in doc
+
+
+# -- the `or` fallbacks coverage.py cannot see ------------------------------
+#
+# coverage.py does not branch on `x or y` inside an expression, so every one of
+# these reported as covered while never executing. The shape that reaches them
+# is a note created outside a meeting: no title, no calendar event, an owner
+# with no name.
+
+
+def test_untitled_note_renders_untitled_everywhere() -> None:
+    payload = note(title=None)
+    summary = render_note(payload, include_private_notes=False, transcript_link=None)
+    transcript = render_transcript(
+        note(title=None, transcript=[{"text": "hi", "speaker": {"source": "microphone"}}]),
+        note_link="../../n/x.md",
+    )
+    assert 'title: "Untitled"' in summary
+    assert "# Untitled" in summary
+    assert "# Untitled — transcript" in transcript
+
+
+def test_owner_falls_back_to_name_when_there_is_no_email() -> None:
+    rendered = render_note(
+        note(owner={"name": "Oat Benson", "email": None}),
+        include_private_notes=False,
+        transcript_link=None,
+    )
+    assert 'owner: "Oat Benson"' in rendered
+
+
+def test_owner_prefers_email_over_name() -> None:
+    rendered = render_note(
+        note(owner={"name": "Oat Benson", "email": "oat@granola.ai"}),
+        include_private_notes=False,
+        transcript_link=None,
+    )
+    assert 'owner: "oat@granola.ai"' in rendered
+
+
+def test_owner_is_empty_when_neither_is_present() -> None:
+    rendered = render_note(note(owner={}), include_private_notes=False, transcript_link=None)
+    assert 'owner: ""' in rendered
+
+
+def test_summary_falls_back_to_plain_text() -> None:
+    rendered = render_note(
+        note(summary_markdown=None, summary_text="Plain text summary."),
+        include_private_notes=False,
+        transcript_link=None,
+    )
+    assert "Plain text summary." in rendered
+
+
+def test_private_notes_fall_back_to_plain_text() -> None:
+    rendered = render_note(
+        note(private_notes_markdown=None, private_notes_text="Plain private note."),
+        include_private_notes=True,
+        transcript_link=None,
+    )
+    assert "Plain private note." in rendered
+
+
+def test_absent_timestamps_render_as_empty_strings() -> None:
+    rendered = render_note(
+        note(created_at=None, updated_at=None), include_private_notes=False, transcript_link=None
+    )
+    assert 'created_at: ""' in rendered
+    assert 'updated_at: ""' in rendered
