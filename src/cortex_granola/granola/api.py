@@ -16,6 +16,11 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
+# Granola's payloads are JSON objects whose shape the API owns, so the client
+# carries them as plain dicts and lets parse.py impose meaning. The alias keeps
+# that decision legible rather than spelling `dict[str, Any]` out sixteen times.
+JsonDict = dict[str, Any]
+
 BASE_URL = "https://public-api.granola.ai"
 
 # Documented limits: 25 request burst, 5 requests/second sustained.
@@ -69,7 +74,7 @@ class GranolaClient:
 
     # -- transport ---------------------------------------------------------
 
-    def _get(self, path: str, params: dict[str, Any] | None = None) -> dict:
+    def _get(self, path: str, params: JsonDict | None = None) -> JsonDict:
         query = {k: v for k, v in (params or {}).items() if v is not None}
         url = f"{BASE_URL}{path}"
         if query:
@@ -96,7 +101,14 @@ class GranolaClient:
                 with urllib.request.urlopen(  # nosec B310 - https asserted above
                     req, timeout=self._timeout
                 ) as resp:
-                    return json.load(resp)
+                    payload = json.load(resp)
+                # An HTML error page or a bare JSON array would otherwise fail
+                # much later, as an AttributeError inside a caller.
+                if not isinstance(payload, dict):
+                    raise GranolaError(
+                        0, f"expected a JSON object from {path}, got {type(payload).__name__}"
+                    )
+                return payload
             except urllib.error.HTTPError as exc:
                 with exc:
                     body = exc.read().decode("utf-8", "replace")
@@ -118,20 +130,29 @@ class GranolaClient:
 
         raise AssertionError("unreachable")
 
-    def _paginate(self, path: str, key: str, params: dict[str, Any]) -> Iterator[dict]:
-        cursor = None
+    def _paginate(self, path: str, key: str, params: JsonDict) -> Iterator[JsonDict]:
+        cursor: str | None = None
         while True:
             page = self._get(path, {**params, "cursor": cursor})
-            yield from page.get(key) or []
+            items = page.get(key) or []
+            if not isinstance(items, list):
+                raise GranolaError(
+                    0, f"expected a list at {key!r} from {path}, got {type(items).__name__}"
+                )
+            for item in items:
+                if not isinstance(item, dict):
+                    raise GranolaError(0, f"expected objects in {key!r}, got {type(item).__name__}")
+                yield item
             # The API echoes hasMore=true on the final page in some cases,
             # so a null/absent cursor is the authoritative stop signal.
-            cursor = page.get("cursor")
+            next_cursor = page.get("cursor")
+            cursor = next_cursor if isinstance(next_cursor, str) and next_cursor else None
             if not page.get("hasMore") or not cursor:
                 return
 
     # -- endpoints ---------------------------------------------------------
 
-    def list_folders(self) -> list[dict]:
+    def list_folders(self) -> list[JsonDict]:
         return list(self._paginate("/v1/folders", "folders", {"page_size": FOLDERS_PAGE_SIZE}))
 
     def list_notes(
@@ -141,7 +162,7 @@ class GranolaClient:
         created_after: str | None = None,
         created_before: str | None = None,
         updated_after: str | None = None,
-    ) -> Iterator[dict]:
+    ) -> Iterator[JsonDict]:
         return self._paginate(
             "/v1/notes",
             "notes",
@@ -154,13 +175,13 @@ class GranolaClient:
             },
         )
 
-    def get_note(self, note_id: str, *, include_transcript: bool = False) -> dict:
+    def get_note(self, note_id: str, *, include_transcript: bool = False) -> JsonDict:
         return self._get(
             f"/v1/notes/{note_id}",
             {"include": "transcript"} if include_transcript else None,
         )
 
-    def get_transcript(self, note_id: str) -> list[dict]:
+    def get_transcript(self, note_id: str) -> list[JsonDict]:
         return list(
             self._paginate(
                 f"/v1/notes/{note_id}/transcript",

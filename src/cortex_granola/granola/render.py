@@ -12,10 +12,16 @@ import datetime as dt
 import re
 import unicodedata
 
+from cortex_granola.granola.api import JsonDict
+
 MAX_SLUG = 60
 
+# Speaker source when nothing better identifies who was talking. `microphone`
+# is the note-taker's own audio stream; `speaker` is everyone else's.
+_SOURCE_LABELS = {"microphone": "Me", "speaker": "Them"}
 
-def note_timestamp(note: dict) -> dt.datetime | None:
+
+def note_timestamp(note: JsonDict) -> dt.datetime | None:
     """The meeting's instant, or None when the note carries no usable one.
 
     The single definition of that precedence. It had two: this one and
@@ -31,7 +37,7 @@ def note_timestamp(note: dict) -> dt.datetime | None:
     return None
 
 
-def note_date(note: dict) -> dt.datetime:
+def note_date(note: JsonDict) -> dt.datetime:
     """Prefer the scheduled meeting time; fall back to now for a filename.
 
     The fallback exists because a file needs a name even when a note has no
@@ -42,7 +48,7 @@ def note_date(note: dict) -> dt.datetime:
     return note_timestamp(note) or dt.datetime.now(dt.UTC)
 
 
-def relative_path(note: dict) -> str:
+def relative_path(note: JsonDict) -> str:
     """Path within either output tree; both use the same shape."""
     when = note_date(note)
     slug = slugify(note.get("title") or "untitled")
@@ -58,7 +64,7 @@ def slugify(title: str) -> str:
     return (slug[:MAX_SLUG].rstrip("-")) or "untitled"
 
 
-def render_note(note: dict, *, include_private_notes: bool, transcript_link: str | None) -> str:
+def render_note(note: JsonDict, *, include_private_notes: bool, transcript_link: str | None) -> str:
     """The AI summary document."""
     body: list[str] = [
         _frontmatter(
@@ -84,7 +90,7 @@ def render_note(note: dict, *, include_private_notes: bool, transcript_link: str
     return "\n".join(body).rstrip() + "\n"
 
 
-def render_transcript(note: dict, *, note_link: str) -> str:
+def render_transcript(note: JsonDict, *, note_link: str) -> str:
     """The verbatim transcript document."""
     body: list[str] = [
         _frontmatter(note, kind="transcript", extra=[("summary_file", note_link)]),
@@ -99,7 +105,7 @@ def render_transcript(note: dict, *, note_link: str) -> str:
     return "\n".join(body).rstrip() + "\n"
 
 
-def _frontmatter(note: dict, *, kind: str, extra: list[tuple[str, str]]) -> str:
+def _frontmatter(note: JsonDict, *, kind: str, extra: list[tuple[str, str]]) -> str:
     """The YAML block both renderers share.
 
     `extra` is appended verbatim so each renderer can cross-link to the other
@@ -138,7 +144,7 @@ def _frontmatter(note: dict, *, kind: str, extra: list[tuple[str, str]]) -> str:
     return "\n".join(lines)
 
 
-def _render_transcript(items: list[dict]) -> str:
+def _render_transcript(items: list[JsonDict]) -> str:
     lines: list[str] = []
     last_speaker = None
     for item in items:
@@ -155,20 +161,31 @@ def _render_transcript(items: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _speaker_label(speaker: dict) -> str:
-    if speaker.get("name"):
-        return speaker["name"]
-    if speaker.get("diarization_label"):
-        return speaker["diarization_label"]
+def _speaker_label(speaker: JsonDict) -> str:
+    """Best available name for whoever spoke, most specific first.
+
+    A resolved name beats a diarization label, which beats the me/them
+    attribution, which beats the raw audio source. Every rung can be absent:
+    iOS notes carry only a `diarization_label`, and older ones only `source`.
+    """
+    for field in ("name", "diarization_label"):
+        value = speaker.get(field)
+        if isinstance(value, str) and value:
+            return value
+
     attribution = speaker.get("attribution")
     if attribution == "me":
         return "Me"
     if attribution == "them":
         return "Them"
-    return {"microphone": "Me", "speaker": "Them"}.get(speaker.get("source"), "Unknown")
+
+    source = speaker.get("source")
+    if isinstance(source, str):
+        return _SOURCE_LABELS.get(source, "Unknown")
+    return "Unknown"
 
 
-def _attendee_lines(note: dict) -> list[str]:
+def _attendee_lines(note: JsonDict) -> list[str]:
     seen: dict[str, str] = {}
     sources = list(note.get("attendees") or [])
     for invitee in (note.get("calendar_event") or {}).get("invitees") or []:
