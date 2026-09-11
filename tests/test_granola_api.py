@@ -771,11 +771,16 @@ def test_a_persistent_body_read_failure_becomes_a_granola_error(
 def test_a_keyboard_interrupt_during_the_error_body_read_is_not_swallowed(
     clock: FakeClock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The reason _error_body is not `except Exception` or `except BaseException`.
+    """The reason _error_body is not `except BaseException`.
 
-    Both of those widenings previously survived mutation: nothing distinguished
-    them, so a SIGINT arriving mid-read was swallowed and reported as a clean
-    retry while the operator was trying to stop a long-running poller.
+    That widening previously survived mutation: nothing distinguished it, so a
+    SIGINT arriving mid-read was swallowed and reported as a clean retry while
+    the operator was trying to stop a long-running poller.
+
+    Says BaseException, not Exception: KeyboardInterrupt is not an Exception, so
+    this test cannot and does not rule `except Exception` out. That one is
+    equivalent here for a different reason -- errors="replace" makes the only
+    Exception-not-OSError candidate impossible, which its own test pins.
     """
     respond_with(monkeypatch, [exploding_http_error(503, KeyboardInterrupt(), {})])
 

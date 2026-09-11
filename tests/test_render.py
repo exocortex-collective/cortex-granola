@@ -522,9 +522,16 @@ def test_render_transcript_rejects_malformed_segments(segments: object, expected
     "segment", [{"speaker": {"source": "microphone"}}, {"text": None}, {"text": "  "}]
 )
 def test_render_transcript_skips_segments_with_no_text(segment: dict[str, Any]) -> None:
-    # Absent text is ordinary; only a wrong TYPE is fatal.
+    """Absent text is ordinary; only a wrong TYPE is fatal.
+
+    Asserts the body is EMPTY, not that some substring is present. Two weaker
+    forms were tried and measured: `"transcript" in rendered` is satisfied by
+    the frontmatter's own `kind: transcript` line, and `"**" not in body` misses
+    a segment that emits text without opening a speaker block. Both leave an
+    appended-junk mutation alive.
+    """
     rendered = render_transcript(note(transcript=[segment]), note_link="../../n/x.md")
-    assert "transcript" in rendered
+    assert rendered.split("[Summary](../../n/x.md)", 1)[1].strip() == ""
 
 
 def test_render_transcript_keeps_the_line_when_one_speaker_record_is_absent() -> None:
@@ -650,6 +657,23 @@ def test_a_member_with_an_empty_name_is_skipped() -> None:
     )
     assert 'folders:\n  - "Real"' in rendered
     assert '- ""' not in rendered
+
+
+@pytest.mark.parametrize("falsy", [{}, "", 0, False, 0.0])
+def test_render_transcript_rejects_a_falsy_wrong_typed_transcript(falsy: object) -> None:
+    """The rows that removing the caller's `or []` actually changed.
+
+    None and [] render identically, so the absent-transcript test below cannot
+    detect the `or []` coming back. These five can: with it, they collapse to an
+    empty list and render a header-only document; without it, they reach the
+    type guard and raise.
+
+    This is render's half of Cortex-iq8. Export still never gets here for these
+    values -- it drops TRANSCRIPT from the wanted set on truthiness first -- so
+    closing this alone does not close the deletion bug.
+    """
+    with pytest.raises(MalformedNote, match="transcript must be a list"):
+        render_transcript(note(transcript=falsy), note_link="../../n/x.md")
 
 
 def test_an_absent_transcript_renders_no_body() -> None:

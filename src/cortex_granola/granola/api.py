@@ -303,10 +303,13 @@ def _error_body(exc: urllib.error.HTTPError) -> str:
     -- what HTTPResponse.read() actually raises on a truncated body, and the
     likeliest failure here -- derives from HTTPException and is NOT an OSError.
 
-    Deliberately not `except Exception`: a UnicodeDecodeError cannot happen here
-    (errors="replace" is load-bearing and tested), and widening further would
-    swallow a KeyboardInterrupt mid-read in a long-running poller, reporting a
-    clean retry while the operator is trying to stop it.
+    The SIGINT argument rules out `except BaseException`, not `except Exception`
+    -- KeyboardInterrupt is not an Exception, and an earlier version of this
+    docstring conflated the two. `except Exception` is behaviourally equivalent
+    here, because the only Exception-not-OSError candidate on that line is
+    UnicodeDecodeError, which errors="replace" makes impossible. The narrow set
+    is kept because it states which failures are expected rather than catching
+    whatever arrives.
     """
     try:
         with exc:
