@@ -30,6 +30,14 @@ class MalformedNote(ValueError):
     written_at = NOW(); a header-only document written over a good file reports
     success while destroying the content it replaced. The crash this class
     replaces was ugly but safe, because it left the old file and a traceback.
+
+    This closes render's half only, and does NOT make export safe on its own:
+    export decides which files it wants BEFORE calling render, by truthiness, so
+    a wrong-typed but falsy field never reaches this check and is read as a
+    withdrawal (Cortex-iq8). Raising here also meets an export worker that
+    counts an error as progress and re-runs without sleeping (Cortex-v42), and
+    an export that writes the summary before rendering the transcript
+    (Cortex-d2n). Those three are export's to fix.
     """
 
 
@@ -127,7 +135,7 @@ def render_transcript(note: JsonDict, *, note_link: str) -> str:
         "",
         f"[Summary]({note_link})",
         "",
-        _render_transcript(note.get("transcript") or []),
+        _render_transcript(note.get("transcript")),
         "",
     ]
     return "\n".join(body).rstrip() + "\n"
@@ -182,6 +190,10 @@ def _render_transcript(items: object) -> str:
     A missing or empty text field skips that segment, which is ordinary. A
     wrong-TYPED one raises: returning "" here would hand export a header-only
     transcript to write over a complete one.
+
+    The None check is the only one -- the caller passes note.get("transcript")
+    straight through rather than collapsing it with `or []`, which would leave
+    this branch unreachable and untestable.
     """
     if items is None:
         return ""
@@ -269,8 +281,12 @@ def _member_names(members: object, field: str) -> list[str]:
     making that claim on the export path.
 
     A member with no name is skipped -- that is a real shape. A non-list, or a
-    member that is not an object, raises: dropping folders silently would write
-    a note into the vault with its exclusion metadata quietly missing.
+    member that is not an object, raises: these names are the note's only record
+    in the vault of where it lived, and a reader grepping for a folder would get
+    a wrong answer rather than an error.
+
+    Not a deny-list concern, despite an earlier version of this docstring saying
+    so: sync skips denied notes before render ever sees them.
     """
     if members is None:
         return []

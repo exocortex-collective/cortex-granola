@@ -428,17 +428,25 @@ def test_frontmatter_skips_members_with_no_name() -> None:
 
 
 @pytest.mark.parametrize(
-    "membership",
-    [42, "a string", {"not": "a list"}, ["not a dict"], [{"name": 42}], [{"name": ["x"]}]],
+    ("membership", "expected"),
+    [
+        (42, "folder_membership must be a list"),
+        ("a string", "folder_membership must be a list"),
+        ({"not": "a list"}, "folder_membership must be a list"),
+        (["not a dict"], r"folder_membership\[0\] must be an object"),
+        ([{"name": "ok"}, "not a dict"], r"folder_membership\[1\] must be an object"),
+        ([{"name": 42}], r"folder_membership\[0\]\.name must be a string"),
+        ([{"name": ["x"]}], r"folder_membership\[0\]\.name must be a string"),
+    ],
 )
-def test_frontmatter_rejects_malformed_membership(membership: object) -> None:
+def test_frontmatter_rejects_malformed_membership(membership: object, expected: str) -> None:
     """Wrong-typed membership must stop the export, not quietly vanish.
 
     Dropping it silently would write the note into the vault with its folder
     metadata missing -- and since the deny list is expressed in folders, a note
     whose folders disappeared is exactly the note that must not be written.
     """
-    with pytest.raises(MalformedNote, match="folder_membership"):
+    with pytest.raises(MalformedNote, match=expected):
         render_note(
             note(folder_membership=membership), include_private_notes=False, transcript_link=None
         )
@@ -526,10 +534,19 @@ def test_render_transcript_keeps_the_line_when_one_speaker_record_is_absent() ->
     missing label -- and a test that only asserts "no crash" passes when it does.
     """
     rendered = render_transcript(
-        note(transcript=[{"text": "Said something.", "speaker": None}]),
+        note(
+            transcript=[
+                {"text": "Alice speaking.", "speaker": {"name": "Alice"}},
+                {"text": "Said something.", "speaker": None},
+            ]
+        ),
         note_link="../../n/x.md",
     )
     assert "Said something." in rendered
+    # And it must not inherit the previous speaker's name: falling back to
+    # `last_speaker` keeps the line but attributes it to Alice, which is worse
+    # than losing it. An absent speaker record is Unknown, not the last one.
+    assert rendered.index("**Unknown**") > rendered.index("**Alice**")
 
 
 def test_both_documents_carry_the_granola_id_and_their_kind() -> None:
@@ -592,6 +609,18 @@ def test_summary_falls_back_to_plain_text() -> None:
     assert "Plain text summary." in rendered
 
 
+def test_summary_prefers_markdown_over_plain_text() -> None:
+    # Reversing the pair silently replaces every formatted summary in the vault
+    # with its flattened twin, and nothing else would notice.
+    rendered = render_note(
+        note(summary_markdown="## Formatted", summary_text="Flattened"),
+        include_private_notes=False,
+        transcript_link=None,
+    )
+    assert "## Formatted" in rendered
+    assert "Flattened" not in rendered
+
+
 def test_private_notes_fall_back_to_plain_text() -> None:
     rendered = render_note(
         note(private_notes_markdown=None, private_notes_text="Plain private note."),
@@ -599,6 +628,35 @@ def test_private_notes_fall_back_to_plain_text() -> None:
         transcript_link=None,
     )
     assert "Plain private note." in rendered
+
+
+def test_private_notes_prefer_markdown_over_plain_text() -> None:
+    rendered = render_note(
+        note(private_notes_markdown="- Formatted", private_notes_text="Flattened"),
+        include_private_notes=True,
+        transcript_link=None,
+    )
+    assert "- Formatted" in rendered
+    assert "Flattened" not in rendered
+
+
+def test_a_member_with_an_empty_name_is_skipped() -> None:
+    # The false arm of `if name:` -- no param supplied {"name": ""}, so removing
+    # the guard entirely survived.
+    rendered = render_note(
+        note(folder_membership=[{"name": ""}, {"name": "Real"}]),
+        include_private_notes=False,
+        transcript_link=None,
+    )
+    assert 'folders:\n  - "Real"' in rendered
+    assert '- ""' not in rendered
+
+
+def test_an_absent_transcript_renders_no_body() -> None:
+    # The `items is None` branch, now reachable: the caller no longer collapses
+    # None with `or []`.
+    rendered = render_transcript(note(transcript=None), note_link="../../n/x.md")
+    assert rendered.rstrip().endswith("[Summary](../../n/x.md)")
 
 
 def test_absent_timestamps_render_as_empty_strings() -> None:

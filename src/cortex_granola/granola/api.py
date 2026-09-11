@@ -155,12 +155,20 @@ class GranolaClient:
                 delay = min(MAX_BACKOFF, 2.0**attempt)
                 log.warning("network error on %s (%s); retrying in %.1fs", path, exc.reason, delay)
                 self._sleep(delay)
-            except (http.client.HTTPException, TimeoutError) as exc:
+            except (OSError, http.client.HTTPException) as exc:
                 # Raised while READING the body, after the response headers
-                # arrived. http.client.IncompleteRead is HTTPException-derived,
-                # not OSError, and urllib only wraps connect-phase failures in
-                # URLError -- so neither handler above sees either of these, and
-                # both escaped _get entirely. Transient, so they retry.
+                # arrived. urllib only wraps connect-phase failures in URLError,
+                # so none of these reach the handler above.
+                #
+                # The set matches _error_body's exactly, and must: an earlier
+                # version caught only (HTTPException, TimeoutError), which let
+                # ssl.SSLError, ConnectionResetError, BrokenPipeError and plain
+                # OSError escape _get unretried. Both clauses are guarding the
+                # same operation on the same socket, so they take the same set.
+                #
+                # Ordering note: this MUST stay below the URLError clause --
+                # URLError is an OSError subclass, and inverting them would
+                # route every connect-phase failure here.
                 if attempt == self._max_retries:
                     raise GranolaError(0, f"{path}: {type(exc).__name__}: {exc}") from exc
                 delay = min(MAX_BACKOFF, 2.0**attempt)
@@ -294,6 +302,11 @@ def _error_body(exc: urllib.error.HTTPError) -> str:
     HTTPException is caught alongside OSError because http.client.IncompleteRead
     -- what HTTPResponse.read() actually raises on a truncated body, and the
     likeliest failure here -- derives from HTTPException and is NOT an OSError.
+
+    Deliberately not `except Exception`: a UnicodeDecodeError cannot happen here
+    (errors="replace" is load-bearing and tested), and widening further would
+    swallow a KeyboardInterrupt mid-read in a long-running poller, reporting a
+    clean retry while the operator is trying to stop it.
     """
     try:
         with exc:

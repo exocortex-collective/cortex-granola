@@ -12,6 +12,7 @@ from __future__ import annotations
 import http.client
 import io
 import json
+import ssl
 import urllib.error
 import urllib.parse
 from email.message import Message
@@ -73,7 +74,11 @@ def http_error(
     for key, value in (headers or {}).items():
         message[key] = value
     return urllib.error.HTTPError(
-        "https://public-api.granola.ai/v1/notes", status, "err", message, io.BytesIO(body.encode())
+        "https://public-api.granola.ai/v1/notes",
+        status,
+        "err",
+        message,
+        io.BytesIO(body.encode("utf-8", "surrogateescape")),
     )
 
 
@@ -712,7 +717,20 @@ def test_a_failing_error_body_read_does_not_defeat_the_retry(
 
 
 @pytest.mark.parametrize(
-    "error", [http.client.IncompleteRead(b"partial"), TimeoutError("read timed out")]
+    "error",
+    [
+        http.client.IncompleteRead(b"partial"),
+        TimeoutError("read timed out"),
+        # The set below is why this handler is (OSError, HTTPException) and not
+        # (HTTPException, TimeoutError): an earlier version caught the latter,
+        # and every one of these escaped _get unretried. The error-path test
+        # above already parametrized ConnectionResetError -- keeping it out of
+        # THIS list is what let the narrow handler look tested.
+        ConnectionResetError("connection reset by peer"),
+        BrokenPipeError("broken pipe"),
+        ssl.SSLError("decryption failed"),
+        OSError("generic socket failure"),
+    ],
 )
 def test_a_truncated_success_body_is_retried(
     clock: FakeClock, monkeypatch: pytest.MonkeyPatch, error: BaseException
@@ -748,3 +766,54 @@ def test_a_persistent_body_read_failure_becomes_a_granola_error(
 
     with pytest.raises(GranolaError, match="IncompleteRead"):
         client(clock, max_retries=1)._get("/v1/notes")
+
+
+def test_a_keyboard_interrupt_during_the_error_body_read_is_not_swallowed(
+    clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reason _error_body is not `except Exception` or `except BaseException`.
+
+    Both of those widenings previously survived mutation: nothing distinguished
+    them, so a SIGINT arriving mid-read was swallowed and reported as a clean
+    retry while the operator was trying to stop a long-running poller.
+    """
+    respond_with(monkeypatch, [exploding_http_error(503, KeyboardInterrupt(), {})])
+
+    with pytest.raises(KeyboardInterrupt):
+        client(clock)._get("/v1/notes")
+
+
+def test_an_unreadable_error_body_becomes_an_empty_string_and_a_warning(
+    clock: FakeClock, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Pins the `return ""` value and the warning, not just the line.
+
+    Both were line-covered and unasserted: replacing the return value, and
+    deleting the log.warning entirely, each survived.
+    """
+    respond_with(monkeypatch, [exploding_http_error(404, ConnectionResetError("gone"), {})])
+
+    with caplog.at_level("WARNING"), pytest.raises(GranolaError) as caught:
+        client(clock)._get("/v1/notes")
+
+    assert caught.value.args[0] == "HTTP 404: "
+    assert caught.value.code is None
+    assert "could not read error body" in caplog.text
+
+
+def test_an_undecodable_error_body_does_not_defeat_the_retry(
+    clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """errors="replace" is load-bearing: a UnicodeDecodeError is a ValueError.
+
+    Neither OSError nor HTTPException catches it, so a strict decode would let
+    a 503 whose body is not valid UTF-8 escape _get unretried -- the exact
+    failure _error_body exists to prevent, arriving through the decode instead
+    of the read.
+    """
+    respond_with(
+        monkeypatch,
+        [http_error(503, "\udcff\udcfe upstream connect error"), {"ok": True}],
+    )
+
+    assert client(clock)._get("/v1/notes") == {"ok": True}
