@@ -202,8 +202,13 @@ class GranolaClient:
                 if not isinstance(item, dict):
                     raise GranolaError(0, f"expected objects in {key!r}, got {type(item).__name__}")
                 yield item
-            # The API echoes hasMore=true on the final page in some cases,
-            # so a null/absent cursor is the authoritative stop signal.
+            # Stop on a null/absent cursor rather than on hasMore. The
+            # inherited comment here said the API echoes hasMore=true on the
+            # final page; nothing in this repo, its history or the Granola docs
+            # substantiates that, as test_paginate_stops_when_cursor_is_null_
+            # despite_has_more says in as many words. The behaviour is kept
+            # because a cursor is the thing you can actually follow, not
+            # because the story about hasMore was ever verified.
             next_cursor = page.get("cursor")
             cursor = next_cursor if isinstance(next_cursor, str) and next_cursor else None
             if not page.get("hasMore") or not cursor:

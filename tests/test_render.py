@@ -744,3 +744,23 @@ def test_render_note_ends_with_exactly_one_newline() -> None:
     rendered = render_note(note(), include_private_notes=False, transcript_link=None)
 
     assert rendered.endswith("\n") and not rendered.endswith("\n\n")
+
+
+def test_frontmatter_date_is_the_meeting_date() -> None:
+    # The one frontmatter field nothing asserted: "date: 1970-01-01" hardcoded
+    # on every note in the vault passed all 354 tests. It is what a reader
+    # sorts and filters by, and it is the same value relative_path files the
+    # note under -- so a drift here desynchronises the directory from the
+    # document with nothing to notice.
+    rendered = render_note(note(), include_private_notes=False, transcript_link=None)
+
+    assert "date: 2026-01-27" in rendered
+
+
+def test_render_transcript_ends_with_exactly_one_newline() -> None:
+    # The summary renderer got this in round 6; the transcript renderer has the
+    # identical line and got nothing. export writes both return values verbatim,
+    # so the transcript tree is exactly as exposed as the notes tree.
+    rendered = render_transcript(note(), note_link="../../n/x.md")
+
+    assert rendered.endswith("\n") and not rendered.endswith("\n\n")
