@@ -344,10 +344,14 @@ def _parse_ts(value: object) -> dt.datetime | None:
 
     Annotated `object` because callers pass raw payload values; the str() below
     was already coercing whatever arrived.
+
+    No `Z` -> `+00:00` substitution: fromisoformat has accepted the designator
+    natively since 3.11, and pyproject requires >=3.11. The old replace() read
+    as a live 3.10 shim and was a provably equivalent mutant.
     """
     if not value or not isinstance(value, str):
         return None
     try:
-        return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return dt.datetime.fromisoformat(value)
     except ValueError:
         return None

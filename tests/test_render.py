@@ -716,3 +716,31 @@ def test_absent_timestamps_render_as_empty_strings() -> None:
     )
     assert 'created_at: ""' in rendered
     assert 'updated_at: ""' in rendered
+
+
+def test_attendee_lines_strips_surrounding_whitespace() -> None:
+    # Not cosmetic: the dedup key is built from the email, so a padded address
+    # keys differently and the same person renders twice.
+    result = _attendee_lines(
+        note(
+            attendees=[{"email": " Oat@Granola.ai ", "name": " Oat "}],
+            calendar_event={"invitees": [{"email": "oat@granola.ai"}]},
+        )
+    )
+    assert result == ["Oat <Oat@Granola.ai>"]
+
+
+def test_render_note_omits_the_transcript_key_when_there_is_no_transcript() -> None:
+    # An empty transcript_file in the frontmatter is a link to a file the
+    # export just unlinked. The turning-transcripts-off test asserts the file
+    # is gone and the summary survives, never that the summary stopped
+    # advertising it.
+    rendered = render_note(note(), include_private_notes=False, transcript_link=None)
+
+    assert "transcript_file:" not in rendered
+
+
+def test_render_note_ends_with_exactly_one_newline() -> None:
+    rendered = render_note(note(), include_private_notes=False, transcript_link=None)
+
+    assert rendered.endswith("\n") and not rendered.endswith("\n\n")
