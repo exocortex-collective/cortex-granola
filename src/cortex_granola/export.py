@@ -213,10 +213,13 @@ def _has_transcript(raw: dict[str, Any]) -> bool:
     MalformedNote from the renderer; the guard covered half the cases because
     the renderer is only called for kinds already decided wanted.
 
-    None and [] are the two shapes the API uses for "no transcript" and are a
-    genuine withdrawal when a recorded file exists. Anything else that is not a
-    list is the payload's shape changing under us, and the only safe response to
-    that is to touch nothing.
+    None and [] are what parse.py and render.py already treat as "no transcript"
+    (has_transcript is bool(transcript or []); _render_transcript renders both
+    as empty), so export agrees with the derived tables. Neither shape has been
+    observed from the API yet -- every production transcript is a non-empty
+    array -- but both are a genuine withdrawal when a recorded file exists.
+    Anything else that is not a list is the payload's shape changing under us,
+    and the only safe response to that is to touch nothing.
     """
     transcript = raw.get("transcript")
     if transcript is None:

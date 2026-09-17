@@ -37,7 +37,7 @@ import psycopg2
 from cortex_utils.queue import enqueue
 from psycopg2.extras import Json
 
-from cortex_granola.granola.api import GranolaClient, TranscriptTooLarge
+from cortex_granola.granola.api import GranolaClient, GranolaError, TranscriptTooLarge
 
 PARSE_QUEUE = "granola_parse"
 
@@ -193,9 +193,20 @@ def _fetch_with_transcript(client: GranolaClient, granola_id: str) -> dict[str, 
     """
     try:
         return client.get_note(granola_id, include_transcript=True)
-    except TranscriptTooLarge:
+    except TranscriptTooLarge as too_large:
         note = client.get_note(granola_id, include_transcript=False)
-        note["transcript"] = client.get_transcript(granola_id)
+        segments = client.get_transcript(granola_id)
+        if not segments:
+            # The 413 just said this transcript is too large to inline; a paged
+            # endpoint that then returns nothing is the API contradicting
+            # itself. Storing [] would overwrite the system of record with an
+            # empty transcript, and export treats [] as a withdrawal and
+            # removes the vault file. Refuse, and let the next poll retry.
+            raise GranolaError(
+                0,
+                f"{granola_id}: inline transcript was 413 but the paged endpoint returned nothing",
+            ) from too_large
+        note["transcript"] = segments
         return note
 
 

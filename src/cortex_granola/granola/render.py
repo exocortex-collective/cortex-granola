@@ -54,12 +54,31 @@ def note_timestamp(note: JsonDict) -> dt.datetime | None:
     note is FILED without moving the meeting_date it is filed UNDER -- the same
     note under two different dates depending on which code path you asked.
     """
-    event = note.get("calendar_event") or {}
+    event = _calendar_event(note)
     for value in (event.get("scheduled_start_time"), note.get("created_at")):
         parsed = _parse_ts(value)
         if parsed:
             return parsed
     return None
+
+
+def _calendar_event(note: JsonDict) -> JsonDict:
+    """The calendar event, or {} when there is none. A wrong type raises.
+
+    Truthiness here decided where a note is FILED: note_date falls back to
+    created_at when the event has no start time, and relative_path is built
+    from that date. A falsy wrong-typed event -- [], "", 0 -- read as "no
+    event", the date moved, the path moved, and export wrote the file under a
+    new name and removed the old. Content intact, so a move rather than a loss,
+    but the same asymmetry as the transcript deletion: the truthy wrong types
+    already raised, the falsy ones acted.
+    """
+    event = note.get("calendar_event")
+    if event is None:
+        return {}
+    if not isinstance(event, dict):
+        raise MalformedNote(f"calendar_event must be an object, got {type(event).__name__}")
+    return event
 
 
 def note_date(note: JsonDict) -> dt.datetime:
@@ -149,7 +168,7 @@ def _frontmatter(note: JsonDict, *, kind: str, extra: list[tuple[str, str]]) -> 
     Calendar-event fields appear only when the note has an event; a note
     created outside a meeting has neither start nor end.
     """
-    event = note.get("calendar_event") or {}
+    event = _calendar_event(note)
     folders = _member_names(note.get("folder_membership"), "folder_membership")
     spaces = _member_names(note.get("space_membership"), "space_membership")
     owner = note.get("owner") or {}
@@ -257,7 +276,7 @@ def _speaker_label(speaker: JsonDict) -> str:
 def _attendee_lines(note: JsonDict) -> list[str]:
     seen: dict[str, str] = {}
     sources = list(note.get("attendees") or [])
-    for invitee in (note.get("calendar_event") or {}).get("invitees") or []:
+    for invitee in _calendar_event(note).get("invitees") or []:
         sources.append(invitee)
     for person in sources:
         email = (person.get("email") or "").strip()

@@ -689,3 +689,15 @@ def test_absent_timestamps_render_as_empty_strings() -> None:
     )
     assert 'created_at: ""' in rendered
     assert 'updated_at: ""' in rendered
+
+
+@pytest.mark.parametrize("falsy", [[], "", 0, False], ids=["list", "str", "int", "bool"])
+def test_a_falsy_wrong_typed_calendar_event_does_not_move_the_note(falsy: object) -> None:
+    """Truthiness decided where a note is filed.
+
+    A falsy wrong-typed calendar_event read as "no event", note_date fell back
+    to created_at, relative_path changed, and export wrote the file under the
+    new name and removed the old. The truthy wrong types already raised.
+    """
+    with pytest.raises(MalformedNote, match="calendar_event must be an object"):
+        relative_path(note(calendar_event=falsy))

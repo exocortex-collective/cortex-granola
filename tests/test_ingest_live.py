@@ -271,3 +271,24 @@ def test_other_api_errors_still_propagate(clean: psycopg2.extensions.connection)
 
     with pytest.raises(GranolaError):
         ingest_one(clean, _Failing(_note()), NOTE_ID)
+
+
+@pytest.mark.live
+def test_an_empty_paged_transcript_after_a_413_is_refused(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """The 413 said too large; a paged endpoint returning nothing contradicts it.
+
+    Storing [] would overwrite the record with an empty transcript, and export
+    treats [] as a withdrawal and removes the vault file.
+    """
+    client = _OversizedTranscriptClient(_note(), segments=[])
+
+    with pytest.raises(GranolaError, match="returned nothing"):
+        ingest_one(clean, client, NOTE_ID)
+    clean.rollback()
+
+    with clean.cursor() as cur:
+        cur.execute("SELECT count(*) FROM granola_notes_raw WHERE granola_id = %s", (NOTE_ID,))
+        row = cur.fetchone()
+    assert row is not None and row[0] == 0, "a contradictory note was stored"
