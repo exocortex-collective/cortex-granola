@@ -82,6 +82,18 @@ def http_error(
     )
 
 
+class _Requested(list[str]):
+    """The URLs requested, plus the timeout each call was handed.
+
+    A subclass rather than a second return value so every existing caller keeps
+    treating this as the list of URLs.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.timeouts: list[int | None] = []
+
+
 class FakeResponse(io.BytesIO):
     """urlopen's context manager over a canned JSON body.
 
@@ -109,13 +121,15 @@ def respond_with(monkeypatch: pytest.MonkeyPatch, outcomes: list[Any]) -> list[s
     """Serve `outcomes` in order; raise them if they are exceptions.
 
     Returns the list that accumulates each requested URL, so tests can assert
-    on cursors and query parameters without a second seam.
+    on cursors and query parameters without a second seam. The timeout each
+    call was given is recorded on `.timeouts` of that same list.
     """
-    requested: list[str] = []
+    requested: _Requested = _Requested()
     remaining = list(outcomes)
 
     def fake_urlopen(req: Any, timeout: int | None = None) -> FakeResponse:
         requested.append(req.full_url)
+        requested.timeouts.append(timeout)
         outcome = remaining.pop(0)
         if isinstance(outcome, BaseException):
             raise outcome
@@ -145,6 +159,26 @@ def test_token_bucket_sleeps_once_burst_is_exhausted(clock: FakeClock) -> None:
     # One token at 5/s is 0.2s. This is the documented sustained rate; a
     # regression to an unthrottled client shows up here as an empty list.
     assert clock.slept == [pytest.approx(1.0 / RATE_PER_SEC)]
+
+
+def test_token_bucket_spends_the_token_it_waited_for(clock: FakeClock) -> None:
+    """Every other bucket test reaches the sleep branch with tokens == 0.0 exactly.
+
+    That makes the `self.tokens = 0.0` after the sleep a no-op, so deleting it
+    left the whole suite green -- while the bucket settled at twice the
+    documented sustained rate, waiting out each deficit and never spending the
+    token it waited for. Entering the branch with a fraction is what tells
+    waiting-then-spending from waiting-and-keeping.
+    """
+    bucket = _TokenBucket(RATE_PER_SEC, 2, monotonic=clock.monotonic, sleep=clock.sleep)
+    bucket.take()
+    bucket.take()
+    clock.now += 0.1  # half a token back at 5/s
+
+    bucket.take()
+    bucket.take()
+
+    assert clock.slept == [pytest.approx(0.1), pytest.approx(1.0 / RATE_PER_SEC)]
 
 
 def test_token_bucket_refills_over_elapsed_time(clock: FakeClock) -> None:
@@ -822,3 +856,50 @@ def test_an_undecodable_error_body_does_not_defeat_the_retry(
     )
 
     assert client(clock)._get("/v1/notes") == {"ok": True}
+
+
+def test_requests_carry_the_configured_timeout(
+    monkeypatch: pytest.MonkeyPatch, clock: FakeClock
+) -> None:
+    """urlopen without a timeout blocks forever on a stalled socket.
+
+    Nothing in this process calls socket.setdefaulttimeout, so the kwarg is the
+    only thing bounding a request -- and deleting it left all 349 tests green.
+    A hung poll is the silent-stall class the watermark charter warns about:
+    the container stays Up and the archive stops moving.
+    """
+    calls = respond_with(monkeypatch, [{"notes": [], "hasMore": False}])
+
+    list(client(clock, timeout=17).list_notes())
+
+    assert calls.timeouts == [17]
+
+
+def test_every_retry_spends_a_rate_limit_token(
+    monkeypatch: pytest.MonkeyPatch, clock: FakeClock
+) -> None:
+    """The bucket is tested alone and the retry ladder is tested alone.
+
+    The seam between them was not: hoisting the take() above the loop, so only
+    the first attempt spends a token and a 5xx storm runs unthrottled at the
+    retry cadence, survived the whole suite. It is invisible by default because
+    BURST is 25 and no retry test makes more than six attempts, so the bucket
+    never reaches its sleep branch.
+    """
+    respond_with(monkeypatch, [http_error(503), http_error(503), {"notes": []}])
+    granola = client(clock, max_retries=3)
+    takes = {"n": 0}
+    real_take = granola._bucket.take
+
+    def _counting_take() -> None:
+        takes["n"] += 1
+        real_take()
+
+    monkeypatch.setattr(granola._bucket, "take", _counting_take)
+
+    granola._get("/v1/notes")
+
+    # Counted rather than measured through clock.slept: each backoff sleep
+    # advances the fake clock, which refills the bucket, so only the first
+    # attempt would ever reach the sleep branch.
+    assert takes["n"] == 3, "a retry skipped the rate limiter"
