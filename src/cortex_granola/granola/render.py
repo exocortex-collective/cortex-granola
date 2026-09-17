@@ -12,10 +12,41 @@ import datetime as dt
 import re
 import unicodedata
 
+from cortex_granola.granola.api import JsonDict
+
 MAX_SLUG = 60
 
 
-def note_timestamp(note: dict) -> dt.datetime | None:
+class MalformedNote(ValueError):
+    """A note payload whose shape makes a faithful rendering impossible.
+
+    The rule this file follows, and the reason this exists: an ABSENT field is
+    ordinary -- the API documents nullable titles, and a note can have no
+    folders -- and gets a documented fallback. A field of the WRONG TYPE is a
+    payload nobody can render honestly, and it must stop the export.
+
+    Silently dropping it is the one thing that must not happen. render is
+    upstream of export._record, which upserts whatever it is handed with
+    written_at = NOW(); a header-only document written over a good file reports
+    success while destroying the content it replaced. The crash this class
+    replaces was ugly but safe, because it left the old file and a traceback.
+
+    This closes render's half only, and does NOT make export safe on its own:
+    export decides which files it wants BEFORE calling render, by truthiness, so
+    a wrong-typed but falsy field never reaches this check and is read as a
+    withdrawal (Cortex-iq8). Raising here also meets an export worker that
+    counts an error as progress and re-runs without sleeping (Cortex-v42), and
+    an export that writes the summary before rendering the transcript
+    (Cortex-d2n). Those three are export's to fix.
+    """
+
+
+# Speaker source when nothing better identifies who was talking. `microphone`
+# is the note-taker's own audio stream; `speaker` is everyone else's.
+_SOURCE_LABELS = {"microphone": "Me", "speaker": "Them"}
+
+
+def note_timestamp(note: JsonDict) -> dt.datetime | None:
     """The meeting's instant, or None when the note carries no usable one.
 
     The single definition of that precedence. It had two: this one and
@@ -31,21 +62,32 @@ def note_timestamp(note: dict) -> dt.datetime | None:
     return None
 
 
-def note_date(note: dict) -> dt.datetime:
+def note_date(note: JsonDict) -> dt.datetime:
     """Prefer the scheduled meeting time; fall back to now for a filename.
 
     The fallback exists because a file needs a name even when a note has no
-    timestamp. It must not reach the database -- see parse._meeting_date, which
-    stores NULL for exactly this case rather than a value that changes on every
-    re-parse.
+    timestamp.
+
+    It does NOT stay out of the database, and an earlier version of this
+    docstring said it did. parse._meeting_date is clean -- it calls
+    note_timestamp() and stores NULL for a timestamp-less note. But
+    relative_path() also feeds export._wanted_paths(), and export._record()
+    writes that %Y/%Y-%m-%d path into granola_exported_files.relative_path in
+    the same statement that sets written_at from the SERVER clock. Two clocks,
+    one row. Worse, export deletes by comparing old path to new, so a re-export
+    that crosses a client-clock UTC boundary unlinks the old file and walks the
+    note into a different directory while meeting_date stays NULL.
+
+    Tracked as Cortex-px6. Fixing it means export deciding the fallback, not
+    this function.
     """
     return note_timestamp(note) or dt.datetime.now(dt.UTC)
 
 
-def relative_path(note: dict) -> str:
+def relative_path(note: JsonDict) -> str:
     """Path within either output tree; both use the same shape."""
     when = note_date(note)
-    slug = slugify(note.get("title") or "untitled")
+    slug = slugify(_text(note, "title") or "untitled")
     # The note ID keeps the name stable and unique when two meetings on the
     # same day share a title.
     return f"{when:%Y}/{when:%Y-%m-%d}-{slug}-{note['id']}.md"
@@ -58,7 +100,7 @@ def slugify(title: str) -> str:
     return (slug[:MAX_SLUG].rstrip("-")) or "untitled"
 
 
-def render_note(note: dict, *, include_private_notes: bool, transcript_link: str | None) -> str:
+def render_note(note: JsonDict, *, include_private_notes: bool, transcript_link: str | None) -> str:
     """The AI summary document."""
     body: list[str] = [
         _frontmatter(
@@ -84,7 +126,7 @@ def render_note(note: dict, *, include_private_notes: bool, transcript_link: str
     return "\n".join(body).rstrip() + "\n"
 
 
-def render_transcript(note: dict, *, note_link: str) -> str:
+def render_transcript(note: JsonDict, *, note_link: str) -> str:
     """The verbatim transcript document."""
     body: list[str] = [
         _frontmatter(note, kind="transcript", extra=[("summary_file", note_link)]),
@@ -93,13 +135,13 @@ def render_transcript(note: dict, *, note_link: str) -> str:
         "",
         f"[Summary]({note_link})",
         "",
-        _render_transcript(note.get("transcript") or []),
+        _render_transcript(note.get("transcript")),
         "",
     ]
     return "\n".join(body).rstrip() + "\n"
 
 
-def _frontmatter(note: dict, *, kind: str, extra: list[tuple[str, str]]) -> str:
+def _frontmatter(note: JsonDict, *, kind: str, extra: list[tuple[str, str]]) -> str:
     """The YAML block both renderers share.
 
     `extra` is appended verbatim so each renderer can cross-link to the other
@@ -108,8 +150,8 @@ def _frontmatter(note: dict, *, kind: str, extra: list[tuple[str, str]]) -> str:
     created outside a meeting has neither start nor end.
     """
     event = note.get("calendar_event") or {}
-    folders = [f.get("name") for f in note.get("folder_membership") or [] if f.get("name")]
-    spaces = [s.get("name") for s in note.get("space_membership") or [] if s.get("name")]
+    folders = _member_names(note.get("folder_membership"), "folder_membership")
+    spaces = _member_names(note.get("space_membership"), "space_membership")
     owner = note.get("owner") or {}
 
     lines: list[str] = [
@@ -138,12 +180,45 @@ def _frontmatter(note: dict, *, kind: str, extra: list[tuple[str, str]]) -> str:
     return "\n".join(lines)
 
 
-def _render_transcript(items: list[dict]) -> str:
+def _render_transcript(items: object) -> str:
+    """Render transcript segments, or raise if the payload is not renderable.
+
+    Typed `object`, not list[JsonDict]: the caller reads this straight from a
+    payload. Annotating it as a list of dicts is what let a non-dict segment
+    reach .strip() -- mypy believed the annotation and stopped checking.
+
+    A missing or empty text field skips that segment, which is ordinary. A
+    wrong-TYPED one raises: returning "" here would hand export a header-only
+    transcript to write over a complete one.
+
+    The None check is the only one -- the caller passes note.get("transcript")
+    straight through rather than collapsing it with `or []`, which would leave
+    this branch unreachable and untestable.
+    """
+    if items is None:
+        return ""
+    if not isinstance(items, list):
+        raise MalformedNote(f"transcript must be a list, got {type(items).__name__}")
     lines: list[str] = []
     last_speaker = None
-    for item in items:
-        speaker = _speaker_label(item.get("speaker") or {})
-        text = (item.get("text") or "").strip()
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise MalformedNote(
+                f"transcript segment {index} must be an object, got {type(item).__name__}"
+            )
+        raw_speaker = item.get("speaker")
+        if raw_speaker is not None and not isinstance(raw_speaker, dict):
+            raise MalformedNote(
+                f"transcript segment {index} speaker must be an object, "
+                f"got {type(raw_speaker).__name__}"
+            )
+        speaker = _speaker_label(raw_speaker or {})
+        raw_text = item.get("text")
+        if raw_text is not None and not isinstance(raw_text, str):
+            raise MalformedNote(
+                f"transcript segment {index} text must be a string, got {type(raw_text).__name__}"
+            )
+        text = (raw_text or "").strip()
         if not text:
             continue
         if speaker != last_speaker:
@@ -155,20 +230,31 @@ def _render_transcript(items: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _speaker_label(speaker: dict) -> str:
-    if speaker.get("name"):
-        return speaker["name"]
-    if speaker.get("diarization_label"):
-        return speaker["diarization_label"]
+def _speaker_label(speaker: JsonDict) -> str:
+    """Best available name for whoever spoke, most specific first.
+
+    A resolved name beats a diarization label, which beats the me/them
+    attribution, which beats the raw audio source. Every rung can be absent:
+    iOS notes carry only a `diarization_label`, and older ones only `source`.
+    """
+    for field in ("name", "diarization_label"):
+        value = speaker.get(field)
+        if isinstance(value, str) and value:
+            return value
+
     attribution = speaker.get("attribution")
     if attribution == "me":
         return "Me"
     if attribution == "them":
         return "Them"
-    return {"microphone": "Me", "speaker": "Them"}.get(speaker.get("source"), "Unknown")
+
+    source = speaker.get("source")
+    if isinstance(source, str):
+        return _SOURCE_LABELS.get(source, "Unknown")
+    return "Unknown"
 
 
-def _attendee_lines(note: dict) -> list[str]:
+def _attendee_lines(note: JsonDict) -> list[str]:
     seen: dict[str, str] = {}
     sources = list(note.get("attendees") or [])
     for invitee in (note.get("calendar_event") or {}).get("invitees") or []:
@@ -187,22 +273,85 @@ def _attendee_lines(note: dict) -> list[str]:
     return sorted(seen.values())
 
 
+def _member_names(members: object, field: str) -> list[str]:
+    """Names from a folder/space membership list, or raise if it is not one.
+
+    Typed `object` rather than list[JsonDict] because the caller reads it from a
+    payload: the annotation would be a claim, and this function's job is to stop
+    making that claim on the export path.
+
+    A member with no name is skipped -- that is a real shape. A non-list, or a
+    member that is not an object, raises: these names are the note's only record
+    in the vault of where it lived, and a reader grepping for a folder would get
+    a wrong answer rather than an error.
+
+    Not a deny-list concern, despite an earlier version of this docstring saying
+    so: sync skips denied notes before render ever sees them.
+    """
+    if members is None:
+        return []
+    if not isinstance(members, list):
+        raise MalformedNote(f"{field} must be a list, got {type(members).__name__}")
+    names = []
+    for index, member in enumerate(members):
+        if not isinstance(member, dict):
+            raise MalformedNote(f"{field}[{index}] must be an object, got {type(member).__name__}")
+        name = member.get("name")
+        if name is None:
+            continue
+        if not isinstance(name, str):
+            raise MalformedNote(
+                f"{field}[{index}].name must be a string, got {type(name).__name__}"
+            )
+        if name:
+            names.append(name)
+    return names
+
+
+def _text(note: JsonDict, field: str) -> str | None:
+    """A string field from a payload: None when absent, raise when wrong-typed."""
+    value = note.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise MalformedNote(f"{field} must be a string, got {type(value).__name__}")
+    return value
+
+
 def _yaml_list(key: str, values: list[str]) -> str:
     if not values:
         return f"{key}: []"
     return "\n".join([f"{key}:"] + [f"  - {_yaml_str(v)}" for v in values])
 
 
-def _yaml_str(value: str) -> str:
+def _yaml_str(value: object) -> str:
+    """Quote and escape a scalar for YAML. Accepts object: callers pass values
+    read from a payload, and the str() here was already doing the coercion the
+    old `value: str` annotation denied."""
     escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
     escaped = escaped.replace("\n", " ").replace("\r", " ")
     return f'"{escaped}"'
 
 
-def _parse_ts(value: str | None) -> dt.datetime | None:
-    if not value:
+def _parse_ts(value: object) -> dt.datetime | None:
+    """Parse an RFC3339 timestamp, preserving the offset as written.
+
+    Deliberately does NOT normalise to UTC. meeting_date is a DATE column filled
+    from .date() on this result (parse.py), and the filename is a %Y-%m-%d
+    strftime of it (relative_path) -- different mechanisms, same exposure:
+    converting here would move a note across a day boundary for any offset whose
+    local date differs from its UTC date.
+
+    Annotated `object` because callers pass raw payload values; the str() below
+    was already coercing whatever arrived.
+
+    No `Z` -> `+00:00` substitution: fromisoformat has accepted the designator
+    natively since 3.11, and pyproject requires >=3.11. The old replace() read
+    as a live 3.10 shim and was a provably equivalent mutant.
+    """
+    if not value or not isinstance(value, str):
         return None
     try:
-        return dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return dt.datetime.fromisoformat(value)
     except ValueError:
         return None
