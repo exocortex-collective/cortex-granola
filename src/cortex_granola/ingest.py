@@ -37,7 +37,7 @@ import psycopg2
 from cortex_utils.queue import enqueue
 from psycopg2.extras import Json
 
-from cortex_granola.granola.api import GranolaClient
+from cortex_granola.granola.api import GranolaClient, TranscriptTooLarge
 
 PARSE_QUEUE = "granola_parse"
 
@@ -99,7 +99,7 @@ def ingest_one(
     if api_updated_at is not None and _is_current(conn, granola_id, api_updated_at):
         return IngestResult(granola_id, Outcome.UNCHANGED)
 
-    note = client.get_note(granola_id, include_transcript=True)
+    note = _fetch_with_transcript(client, granola_id)
     updated_at = note.get("updated_at")
     if not updated_at:
         # Every note the API returns carries updated_at; its absence means the
@@ -174,6 +174,29 @@ def tombstone(
         commit=False,
     )
     return IngestResult(granola_id, Outcome.DELETED, job_id)
+
+
+def _fetch_with_transcript(client: GranolaClient, granola_id: str) -> dict[str, object]:
+    """The note with its transcript, by whichever route the API allows.
+
+    The inline form has a size limit, and the API answers 413 above it. Nothing
+    caught that: TranscriptTooLarge escaped ingest_one, sync counted the run
+    unclean, the watermark stayed put, and the next poll re-issued the identical
+    request against the identical window -- every fifteen minutes, forever,
+    with the container reporting Up. The paged endpoint the docs say to use
+    instead had zero call sites. One long meeting was all it would have taken;
+    the M1 soak passed because no note had crossed the limit yet.
+
+    The paged segments are spliced in under `transcript`, so the stored raw row
+    has the same shape either way and parse.py does not know which route it
+    came by.
+    """
+    try:
+        return client.get_note(granola_id, include_transcript=True)
+    except TranscriptTooLarge:
+        note = client.get_note(granola_id, include_transcript=False)
+        note["transcript"] = client.get_transcript(granola_id)
+        return note
 
 
 def _is_current(conn: psycopg2.extensions.connection, granola_id: str, api_updated_at: str) -> bool:

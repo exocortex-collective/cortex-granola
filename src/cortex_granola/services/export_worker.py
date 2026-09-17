@@ -169,7 +169,15 @@ class ExportWorker:
                     removed=stats.removed,
                     errors=stats.errors,
                 )
-            else:
+            # Errors are not progress. They used to be: a batch that was
+            # nothing but failures skipped the poll interval and came straight
+            # back for the same note, which failed the same way. Measured: 2,001
+            # run_once calls in 25ms, a full traceback each, no sleep, the
+            # container reporting Up the whole time. A permanently malformed
+            # note -- reachable on main before MalformedNote existed, via an
+            # AttributeError in the renderer -- did this on every poll. Only a
+            # file written or removed says there may be more to do right now.
+            if not (stats.written or stats.removed):
                 self._stop.wait(self.poll_interval_s)
 
         log.info("granola-export-worker stopped")

@@ -23,6 +23,7 @@ from cortex_granola.export import (
     safe_target,
     write_atomically,
 )
+from cortex_granola.granola.render import MalformedNote
 
 NOTE = "not_export0001"
 
@@ -589,3 +590,133 @@ def test_every_migration_file_on_disk_reaches_the_database() -> None:
             .strip()
         )
         assert first_statement in sql, f"{name} was not applied"
+
+
+def _records(conn: psycopg2.extensions.connection) -> dict[str, str]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT kind, relative_path FROM granola_exported_files WHERE granola_id = %s", (NOTE,)
+        )
+        return dict(cur.fetchall())
+
+
+@pytest.mark.live
+@pytest.mark.parametrize("falsy", [{}, "", 0, False], ids=["dict", "str", "int", "bool"])
+def test_a_falsy_wrong_typed_transcript_never_deletes_the_file(
+    clean: psycopg2.extensions.connection, config: ExportConfig, falsy: object
+) -> None:
+    """The decision that deletes a transcript file was plain truthiness.
+
+    A wrong-typed but falsy transcript dropped out of `wanted`, read as "the
+    transcript was withdrawn", and the recorded file was unlinked with the
+    outcome reported as written. Verified on PR #7: a 354-byte file gone,
+    nothing logged. The truthy wrong types already raised from the renderer;
+    the guard covered half the cases.
+    """
+    _store(clean, _raw())
+    export_note(clean, config, NOTE)
+    clean.commit()
+    before = _files(config.transcripts_dir)
+    assert before, "precondition: a transcript file exists to be protected"
+
+    _store(clean, _raw(updated_at="2026-09-01T11:00:00Z", transcript=falsy))
+    with pytest.raises(MalformedNote):
+        export_note(clean, config, NOTE)
+    clean.rollback()
+
+    assert _files(config.transcripts_dir) == before, "a wrong type was read as a withdrawal"
+    assert "transcript" in _records(clean), "the record of the file was dropped"
+
+
+@pytest.mark.live
+@pytest.mark.parametrize("gone", [None, []], ids=["null", "empty"])
+def test_a_genuinely_withdrawn_transcript_still_removes_the_file(
+    clean: psycopg2.extensions.connection, config: ExportConfig, gone: object
+) -> None:
+    """The other half: the two shapes the API uses for no transcript are a withdrawal."""
+    _store(clean, _raw())
+    export_note(clean, config, NOTE)
+    clean.commit()
+    assert _files(config.transcripts_dir)
+
+    _store(clean, _raw(updated_at="2026-09-01T11:00:00Z", transcript=gone))
+    assert export_note(clean, config, NOTE) == "written"
+    clean.commit()
+
+    assert _files(config.transcripts_dir) == []
+    assert "transcript" not in _records(clean)
+    assert _files(config.notes_dir), "the summary stays"
+
+
+# --- the worker loop -----------------------------------------------------------
+
+
+class _StopOnFirstWait:
+    """A stop event that records every wait and ends the loop on the first."""
+
+    def __init__(self) -> None:
+        self.waits: list[float] = []
+        self._set = False
+
+    def is_set(self) -> bool:
+        return self._set
+
+    def set(self) -> None:
+        self._set = True
+
+    def wait(self, timeout: float) -> bool:
+        self.waits.append(timeout)
+        self._set = True
+        return True
+
+
+def _loop_with(
+    monkeypatch: pytest.MonkeyPatch, config: ExportConfig, batches: list[dict[str, int]]
+) -> tuple[_StopOnFirstWait, int]:
+    """Run the worker loop over canned run_once results; stop after them or a wait."""
+    from cortex_granola.export import ExportStats
+    from cortex_granola.services import export_worker
+
+    worker = export_worker.ExportWorker("dbname=unused", config, poll_interval_s=7)
+    stop = _StopOnFirstWait()
+    worker._stop = stop  # type: ignore[assignment]
+    calls = {"n": 0}
+    remaining = list(batches)
+
+    def _run_once() -> ExportStats:
+        calls["n"] += 1
+        stats = ExportStats(**remaining.pop(0))
+        if not remaining:
+            stop.set()
+        return stats
+
+    monkeypatch.setattr(worker, "run_once", _run_once)
+    monkeypatch.setattr(worker, "ensure_schema", lambda: None)
+    monkeypatch.setattr(export_worker.signal, "signal", lambda *_a: None)
+    worker.run()
+    return stop, calls["n"]
+
+
+def test_a_batch_that_only_failed_waits_for_the_poll_interval(
+    monkeypatch: pytest.MonkeyPatch, config: ExportConfig
+) -> None:
+    """Errors are not progress.
+
+    A batch of nothing but failures used to skip the interval and come straight
+    back for the same note. Measured: 2,001 run_once calls in 25ms, a traceback
+    each, the container Up throughout.
+    """
+    stop, calls = _loop_with(monkeypatch, config, [{"errors": 1}, {"errors": 1}])
+
+    assert stop.waits == [7], "a failure-only batch did not sleep"
+    assert calls == 1
+
+
+def test_a_batch_that_wrote_something_comes_straight_back(
+    monkeypatch: pytest.MonkeyPatch, config: ExportConfig
+) -> None:
+    """Real progress means there may be more pending right now; no sleep."""
+    stop, calls = _loop_with(monkeypatch, config, [{"written": 1, "errors": 1}, {"removed": 1}])
+
+    assert stop.waits == []
+    assert calls == 2

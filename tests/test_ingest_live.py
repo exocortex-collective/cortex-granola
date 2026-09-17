@@ -15,6 +15,7 @@ from typing import Any
 import psycopg2
 import pytest
 
+from cortex_granola.granola.api import GranolaError, TranscriptTooLarge
 from cortex_granola.ingest import Outcome, ingest_one, tombstone
 
 NOTE_ID = "not_test0000000001"
@@ -203,3 +204,70 @@ def test_ingest_does_not_commit(clean: psycopg2.extensions.connection) -> None:
         cur.execute("SELECT count(*) FROM granola_notes_raw WHERE granola_id = %s", (NOTE_ID,))
         assert cur.fetchone()[0] == 0
     assert _queue_depth(clean) == 0
+
+
+class _OversizedTranscriptClient(FakeClient):
+    """The API's behaviour above the inline transcript limit.
+
+    The inline form answers 413; the paged endpoint serves the same transcript
+    in pages. Records which routes were taken, because the fallback costing a
+    second and third request is the point of the test, not a side effect.
+    """
+
+    def __init__(self, note: dict[str, Any], segments: list[dict[str, Any]]) -> None:
+        super().__init__(note)
+        self.segments = segments
+        self.routes: list[str] = []
+
+    def get_note(self, note_id: str, *, include_transcript: bool = False) -> dict[str, Any]:
+        self.fetches += 1
+        if include_transcript:
+            self.routes.append("inline")
+            raise TranscriptTooLarge(413, "Payload Too Large", "TRANSCRIPT_TOO_LARGE")
+        self.routes.append("note")
+        return dict(self.note, id=note_id)
+
+    def get_transcript(self, note_id: str) -> list[dict[str, Any]]:
+        self.routes.append("paged")
+        return list(self.segments)
+
+
+@pytest.mark.live
+def test_a_transcript_over_the_inline_limit_is_fetched_by_pages(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """The first long meeting used to wedge the poller for good.
+
+    413 escaped ingest_one, the run counted unclean, the watermark stayed, and
+    the next poll re-issued the identical request. The paged endpoint the API
+    documents for exactly this had no call sites.
+    """
+    segments = [{"speaker": {"name": "Devon"}, "text": f"line {i}"} for i in range(3)]
+    client = _OversizedTranscriptClient(_note(), segments)
+
+    result = ingest_one(clean, client, NOTE_ID)
+    clean.commit()
+
+    assert result.outcome is Outcome.STORED
+    assert client.routes == ["inline", "note", "paged"]
+    with clean.cursor() as cur:
+        cur.execute(
+            "SELECT raw->'transcript', raw->>'title' FROM granola_notes_raw WHERE granola_id = %s",
+            (NOTE_ID,),
+        )
+        row = cur.fetchone()
+    assert row is not None
+    assert row[0] == segments, "the paged transcript was not spliced into the stored note"
+    assert row[1] == "Planning", "the note body was lost on the fallback route"
+
+
+@pytest.mark.live
+def test_other_api_errors_still_propagate(clean: psycopg2.extensions.connection) -> None:
+    """Only the size limit has a second route; a 500 is still the caller's problem."""
+
+    class _Failing(FakeClient):
+        def get_note(self, note_id: str, *, include_transcript: bool = False) -> dict[str, Any]:
+            raise GranolaError(500, "upstream", None)
+
+    with pytest.raises(GranolaError):
+        ingest_one(clean, _Failing(_note()), NOTE_ID)

@@ -29,7 +29,12 @@ import psycopg2
 import structlog
 
 from cortex_granola.config import ExportConfig
-from cortex_granola.granola.render import relative_path, render_note, render_transcript
+from cortex_granola.granola.render import (
+    MalformedNote,
+    relative_path,
+    render_note,
+    render_transcript,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -191,9 +196,34 @@ def _root_for(config: ExportConfig, kind: str) -> Path:
 def _wanted_paths(raw: dict[str, Any], config: ExportConfig) -> dict[str, str]:
     rel = relative_path(raw)
     wanted = {SUMMARY: rel}
-    if config.include_transcript and raw.get("transcript"):
+    if config.include_transcript and _has_transcript(raw):
         wanted[TRANSCRIPT] = rel
     return wanted
+
+
+def _has_transcript(raw: dict[str, Any]) -> bool:
+    """Whether a transcript file is wanted. Absent means no; wrong type means STOP.
+
+    This decision is what deletes a transcript file: a kind that drops out of
+    `wanted` reads as withdrawn, and export_note removes its recorded file. It
+    used to be plain truthiness, so a wrong-typed but FALSY transcript -- {},
+    "", 0 -- was indistinguishable from "the transcript was withdrawn". Verified
+    on PR #7: a 354-byte transcript file unlinked, its record deleted, outcome
+    reported "written", nothing logged. The same wrong type when TRUTHY raised
+    MalformedNote from the renderer; the guard covered half the cases because
+    the renderer is only called for kinds already decided wanted.
+
+    None and [] are the two shapes the API uses for "no transcript" and are a
+    genuine withdrawal when a recorded file exists. Anything else that is not a
+    list is the payload's shape changing under us, and the only safe response to
+    that is to touch nothing.
+    """
+    transcript = raw.get("transcript")
+    if transcript is None:
+        return False
+    if not isinstance(transcript, list):
+        raise MalformedNote(f"transcript must be a list, got {type(transcript).__name__}")
+    return bool(transcript)
 
 
 def _render(raw: dict[str, Any], kind: str, config: ExportConfig, wanted: dict[str, str]) -> str:
