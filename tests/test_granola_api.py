@@ -147,6 +147,26 @@ def test_token_bucket_sleeps_once_burst_is_exhausted(clock: FakeClock) -> None:
     assert clock.slept == [pytest.approx(1.0 / RATE_PER_SEC)]
 
 
+def test_token_bucket_spends_the_token_it_waited_for(clock: FakeClock) -> None:
+    """Every other bucket test reaches the sleep branch with tokens == 0.0 exactly.
+
+    That makes the `self.tokens = 0.0` after the sleep a no-op, so deleting it
+    left the whole suite green -- while the bucket settled at twice the
+    documented sustained rate, waiting out each deficit and never spending the
+    token it waited for. Entering the branch with a fraction is what tells
+    waiting-then-spending from waiting-and-keeping.
+    """
+    bucket = _TokenBucket(RATE_PER_SEC, 2, monotonic=clock.monotonic, sleep=clock.sleep)
+    bucket.take()
+    bucket.take()
+    clock.now += 0.1  # half a token back at 5/s
+
+    bucket.take()
+    bucket.take()
+
+    assert clock.slept == [pytest.approx(0.1), pytest.approx(1.0 / RATE_PER_SEC)]
+
+
 def test_token_bucket_refills_over_elapsed_time(clock: FakeClock) -> None:
     bucket = _TokenBucket(RATE_PER_SEC, BURST, monotonic=clock.monotonic, sleep=clock.sleep)
     for _ in range(BURST):

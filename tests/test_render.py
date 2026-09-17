@@ -70,11 +70,19 @@ def test_slugify(title: str, expected: str) -> None:
 
 
 def test_slugify_truncates_without_a_trailing_hyphen() -> None:
-    # Cutting mid-separator would leave "...word-" and a filename that reads as
-    # truncated garbage; the rstrip is the thing under test.
+    # The truncation, not the rstrip: here the hyphen lands at index 20 and the
+    # cut at 60 lands mid-word, so this passes with rstrip deleted.
     slug = slugify("a" * 20 + " " + "b" * 80)
     assert len(slug) <= MAX_SLUG
     assert not slug.endswith("-")
+
+
+def test_slugify_strips_a_hyphen_left_by_the_cut() -> None:
+    # slug[:MAX_SLUG] ends ON the separator here, so the rstrip is what is
+    # under test. Without it the name carries a trailing hyphen into
+    # relative_path -- and the export worker deletes by previously-rendered
+    # path, so a name that shifts is a file that gets orphaned.
+    assert slugify("a" * 59 + " " + "b" * 20) == "a" * 59
 
 
 def test_slugify_is_pinned_for_a_real_folder_name() -> None:
@@ -251,6 +259,21 @@ def test_attendee_lines_prefers_the_named_record_over_the_bare_invitee() -> None
     assert result == ["Oat Benson <oat@granola.ai>"]
 
 
+def test_attendee_lines_prefers_a_named_invitee_over_a_bare_attendee() -> None:
+    # The len() arm of the dedup. `sources` is attendees-then-invitees, so in
+    # the test above the named record is inserted first and wins on insertion
+    # order alone -- `key not in seen` is sufficient there, and deleting the
+    # length comparison left the whole suite green. Reversing the roles is the
+    # only shape in which that comparison decides the winner.
+    result = _attendee_lines(
+        note(
+            attendees=[{"email": "oat@granola.ai"}],
+            calendar_event={"invitees": [{"name": "Oat Benson", "email": "oat@granola.ai"}]},
+        )
+    )
+    assert result == ["Oat Benson <oat@granola.ai>"]
+
+
 def test_attendee_lines_dedups_case_insensitively() -> None:
     result = _attendee_lines(
         note(
@@ -380,7 +403,9 @@ def test_render_transcript_groups_consecutive_lines_by_speaker() -> None:
     )
     assert rendered.count("**Me**") == 1
     assert "First.\nStill me." in rendered
-    assert "**Them**" in rendered
+    # The blank line, not just the heading: without it the next speaker folds
+    # into the previous speaker's paragraph in the vault.
+    assert "Still me.\n\n**Them**" in rendered
 
 
 def test_render_transcript_skips_empty_segments() -> None:
@@ -442,9 +467,11 @@ def test_frontmatter_skips_members_with_no_name() -> None:
 def test_frontmatter_rejects_malformed_membership(membership: object, expected: str) -> None:
     """Wrong-typed membership must stop the export, not quietly vanish.
 
-    Dropping it silently would write the note into the vault with its folder
-    metadata missing -- and since the deny list is expressed in folders, a note
-    whose folders disappeared is exactly the note that must not be written.
+    Dropping it silently would write the note into the vault with no record of
+    where it lived, and a reader grepping for a folder would get a wrong answer
+    rather than an error. Not a deny-list concern, despite an earlier version of
+    this docstring saying so: sync resolves the deny list and skips denied notes
+    before render ever sees them.
     """
     with pytest.raises(MalformedNote, match=expected):
         render_note(
