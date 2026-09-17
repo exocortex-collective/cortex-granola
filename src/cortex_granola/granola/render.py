@@ -31,13 +31,10 @@ class MalformedNote(ValueError):
     success while destroying the content it replaced. The crash this class
     replaces was ugly but safe, because it left the old file and a traceback.
 
-    This closes render's half only, and does NOT make export safe on its own:
-    export decides which files it wants BEFORE calling render, by truthiness, so
-    a wrong-typed but falsy field never reaches this check and is read as a
-    withdrawal (Cortex-iq8). Raising here also meets an export worker that
-    counts an error as progress and re-runs without sleeping (Cortex-v42), and
-    an export that writes the summary before rendering the transcript
-    (Cortex-d2n). Those three are export's to fix.
+    This closes render's half. Export's half -- deciding which files it wants
+    by type rather than truthiness -- is export._has_transcript, and the export
+    loop no longer counts an error as progress. What remains open is that
+    export writes the summary before rendering the transcript (Cortex-d2n).
     """
 
 
@@ -54,7 +51,7 @@ def note_timestamp(note: JsonDict) -> dt.datetime | None:
     note is FILED without moving the meeting_date it is filed UNDER -- the same
     note under two different dates depending on which code path you asked.
     """
-    event = _calendar_event(note)
+    event = calendar_event(note)
     for value in (event.get("scheduled_start_time"), note.get("created_at")):
         parsed = _parse_ts(value)
         if parsed:
@@ -62,7 +59,7 @@ def note_timestamp(note: JsonDict) -> dt.datetime | None:
     return None
 
 
-def _calendar_event(note: JsonDict) -> JsonDict:
+def calendar_event(note: JsonDict) -> JsonDict:
     """The calendar event, or {} when there is none. A wrong type raises.
 
     Truthiness here decided where a note is FILED: note_date falls back to
@@ -168,7 +165,7 @@ def _frontmatter(note: JsonDict, *, kind: str, extra: list[tuple[str, str]]) -> 
     Calendar-event fields appear only when the note has an event; a note
     created outside a meeting has neither start nor end.
     """
-    event = _calendar_event(note)
+    event = calendar_event(note)
     folders = _member_names(note.get("folder_membership"), "folder_membership")
     spaces = _member_names(note.get("space_membership"), "space_membership")
     owner = note.get("owner") or {}
@@ -276,7 +273,7 @@ def _speaker_label(speaker: JsonDict) -> str:
 def _attendee_lines(note: JsonDict) -> list[str]:
     seen: dict[str, str] = {}
     sources = list(note.get("attendees") or [])
-    for invitee in _calendar_event(note).get("invitees") or []:
+    for invitee in calendar_event(note).get("invitees") or []:
         sources.append(invitee)
     for person in sources:
         email = (person.get("email") or "").strip()

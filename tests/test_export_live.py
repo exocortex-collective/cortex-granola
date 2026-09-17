@@ -633,7 +633,7 @@ def test_a_falsy_wrong_typed_transcript_never_deletes_the_file(
 def test_a_genuinely_withdrawn_transcript_still_removes_the_file(
     clean: psycopg2.extensions.connection, config: ExportConfig, gone: object
 ) -> None:
-    """The other half: the two shapes the API uses for no transcript are a withdrawal."""
+    """The other half: the two shapes this codebase treats as no transcript are a withdrawal."""
     _store(clean, _raw())
     export_note(clean, config, NOTE)
     clean.commit()
