@@ -21,7 +21,7 @@ import structlog
 from psycopg2 import sql
 from psycopg2.extras import Json, execute_values
 
-from cortex_granola.granola.render import note_timestamp
+from cortex_granola.granola.render import calendar_event, note_timestamp
 
 log = structlog.get_logger(__name__)
 
@@ -109,7 +109,7 @@ def _clear_derived(conn: psycopg2.extensions.connection, granola_id: str) -> Non
 
 
 def _write_note(conn: psycopg2.extensions.connection, granola_id: str, raw: dict[str, Any]) -> None:
-    event = raw.get("calendar_event") or {}
+    event = calendar_event(raw)
     owner = raw.get("owner") or {}
     when = _meeting_date(raw)
     transcript = raw.get("transcript") or []
@@ -209,7 +209,7 @@ def _write_attendees(
     """
     people: dict[str, tuple[str, str | None]] = {}
     sources = list(raw.get("attendees") or [])
-    sources.extend((raw.get("calendar_event") or {}).get("invitees") or [])
+    sources.extend(calendar_event(raw).get("invitees") or [])
 
     for person in sources:
         email = (person.get("email") or "").strip()

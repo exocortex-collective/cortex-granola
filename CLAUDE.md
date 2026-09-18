@@ -88,3 +88,6 @@ uv run mypy src
 
 Every PR goes through `pr-review-loop` to convergence. Commits and pushes use
 `scripts/commit-and-push.sh` from that skill, never raw `git commit`/`push`.
+That script runs a bare `git push`, so a fresh branch needs
+`git config push.autoSetupRemote true` in this clone or the push fails after the
+commit lands.

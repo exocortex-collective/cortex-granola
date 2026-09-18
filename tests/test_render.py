@@ -718,6 +718,18 @@ def test_absent_timestamps_render_as_empty_strings() -> None:
     assert 'updated_at: ""' in rendered
 
 
+@pytest.mark.parametrize("falsy", [[], "", 0, False], ids=["list", "str", "int", "bool"])
+def test_a_falsy_wrong_typed_calendar_event_does_not_move_the_note(falsy: object) -> None:
+    """Truthiness decided where a note is filed.
+
+    A falsy wrong-typed calendar_event read as "no event", note_date fell back
+    to created_at, relative_path changed, and export wrote the file under the
+    new name and removed the old. The truthy wrong types already raised.
+    """
+    with pytest.raises(MalformedNote, match="calendar_event must be an object"):
+        relative_path(note(calendar_event=falsy))
+
+
 def test_attendee_lines_strips_surrounding_whitespace() -> None:
     # Not cosmetic: the dedup key is built from the email, so a padded address
     # keys differently and the same person renders twice.

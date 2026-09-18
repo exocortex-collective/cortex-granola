@@ -337,7 +337,7 @@ def test_error_code_in_body_raises_transcript_too_large(
 
 
 def test_transcript_too_large_is_a_granola_error() -> None:
-    # sync.py catches TranscriptTooLarge to fall back to the paged endpoint;
+    # ingest_one catches TranscriptTooLarge to fall back to the paged endpoint;
     # callers that only catch GranolaError must still see it.
     assert issubclass(TranscriptTooLarge, GranolaError)
 

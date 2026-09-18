@@ -37,7 +37,7 @@ import psycopg2
 from cortex_utils.queue import enqueue
 from psycopg2.extras import Json
 
-from cortex_granola.granola.api import GranolaClient
+from cortex_granola.granola.api import GranolaClient, GranolaError, TranscriptTooLarge
 
 PARSE_QUEUE = "granola_parse"
 
@@ -99,7 +99,7 @@ def ingest_one(
     if api_updated_at is not None and _is_current(conn, granola_id, api_updated_at):
         return IngestResult(granola_id, Outcome.UNCHANGED)
 
-    note = client.get_note(granola_id, include_transcript=True)
+    note = _fetch_with_transcript(client, granola_id)
     updated_at = note.get("updated_at")
     if not updated_at:
         # Every note the API returns carries updated_at; its absence means the
@@ -174,6 +174,40 @@ def tombstone(
         commit=False,
     )
     return IngestResult(granola_id, Outcome.DELETED, job_id)
+
+
+def _fetch_with_transcript(client: GranolaClient, granola_id: str) -> dict[str, object]:
+    """The note with its transcript, by whichever route the API allows.
+
+    The inline form has a size limit, and the API answers 413 above it. Nothing
+    caught that: TranscriptTooLarge escaped ingest_one, sync counted the run
+    unclean, the watermark stayed put, and the next poll re-issued the identical
+    request against the identical window -- every fifteen minutes, forever,
+    with the container reporting Up. The paged endpoint the docs say to use
+    instead had zero call sites. One long meeting was all it would have taken;
+    the M1 soak passed because no note had crossed the limit yet.
+
+    The paged segments are spliced in under `transcript`, so the stored raw row
+    has the same shape either way and parse.py does not know which route it
+    came by.
+    """
+    try:
+        return client.get_note(granola_id, include_transcript=True)
+    except TranscriptTooLarge as too_large:
+        note = client.get_note(granola_id, include_transcript=False)
+        segments = client.get_transcript(granola_id)
+        if not segments:
+            # The 413 just said this transcript is too large to inline; a paged
+            # endpoint that then returns nothing is the API contradicting
+            # itself. Storing [] would overwrite the system of record with an
+            # empty transcript, and export treats [] as a withdrawal and
+            # removes the vault file. Refuse, and let the next poll retry.
+            raise GranolaError(
+                0,
+                f"{granola_id}: inline transcript was 413 but the paged endpoint returned nothing",
+            ) from too_large
+        note["transcript"] = segments
+        return note
 
 
 def _is_current(conn: psycopg2.extensions.connection, granola_id: str, api_updated_at: str) -> bool:
