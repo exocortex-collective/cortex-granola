@@ -215,6 +215,19 @@ def test_an_unparseable_scheduled_end_is_dropped_loudly(
 
 
 @pytest.mark.live
+def test_a_scheduled_start_with_no_end_is_not_logged(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """A missing end is ordinary, not malformed."""
+    _store(clean, _raw(calendar_event={"scheduled_start_time": "2026-09-01T12:00:00Z"}))
+    with capture_logs() as logs:
+        parse_note(clean, NOTE)
+    clean.commit()
+    assert _started_ended(clean)[1] is None
+    assert [e for e in logs if e["log_level"] == "warning"] == []
+
+
+@pytest.mark.live
 def test_started_at_and_meeting_date_are_both_null_without_a_timestamp(
     clean: psycopg2.extensions.connection,
 ) -> None:

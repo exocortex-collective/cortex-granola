@@ -171,15 +171,15 @@ def _span(granola_id: str, raw: dict[str, Any]) -> tuple[dt.datetime | None, dt.
     # proxy days late, or an end quietly dropped, should not arrive silently.
     # An end beside no scheduled start is dropped by design and not logged.
     if scheduled is None and event.get("scheduled_start_time"):
-        _warn_unparseable(granola_id, "scheduled_start_time", event)
+        _warn_unparseable(granola_id, "scheduled_start_time", event, "using created_at")
     if scheduled and end is None and event.get("scheduled_end_time"):
-        _warn_unparseable(granola_id, "scheduled_end_time", event)
+        _warn_unparseable(granola_id, "scheduled_end_time", event, "storing NULL")
     return note_timestamp(raw), end
 
 
-def _warn_unparseable(granola_id: str, field: str, event: dict[str, Any]) -> None:
+def _warn_unparseable(granola_id: str, field: str, event: dict[str, Any], action: str) -> None:
     log.warning(
-        "unparseable calendar time, not stored",
+        f"unparseable {field}, {action}",
         granola_id=granola_id,
         field=field,
         value=event.get(field),
