@@ -51,12 +51,21 @@ def note_timestamp(note: JsonDict) -> dt.datetime | None:
     note is FILED without moving the meeting_date it is filed UNDER -- the same
     note under two different dates depending on which code path you asked.
     """
-    event = calendar_event(note)
-    for value in (event.get("scheduled_start_time"), note.get("created_at")):
-        parsed = _parse_ts(value)
-        if parsed:
-            return parsed
-    return None
+    return scheduled_start(note) or _parse_ts(note.get("created_at"))
+
+
+def scheduled_start(note: JsonDict) -> dt.datetime | None:
+    """The calendar event's start, or None when it is missing or unparseable.
+
+    Public so parse.py can tell a calendar start from the created_at fallback:
+    a scheduled end only belongs beside a scheduled start.
+    """
+    return _parse_ts(calendar_event(note).get("scheduled_start_time"))
+
+
+def scheduled_end(note: JsonDict) -> dt.datetime | None:
+    """The calendar event's end, or None when it is missing or unparseable."""
+    return _parse_ts(calendar_event(note).get("scheduled_end_time"))
 
 
 def calendar_event(note: JsonDict) -> JsonDict:

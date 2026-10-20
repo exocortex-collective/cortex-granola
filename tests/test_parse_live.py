@@ -13,6 +13,7 @@ from typing import Any
 import psycopg2
 import pytest
 from psycopg2.extras import Json
+from structlog.testing import capture_logs
 
 from cortex_granola.parse import RawNoteMissingError, parse_note
 
@@ -104,6 +105,156 @@ def test_meeting_date_prefers_the_scheduled_time(clean: psycopg2.extensions.conn
     with clean.cursor() as cur:
         cur.execute("SELECT meeting_date FROM granola_notes WHERE granola_id = %s", (NOTE,))
         assert str(cur.fetchone()[0]) == "2026-09-01"
+
+
+def _started_ended(conn: psycopg2.extensions.connection) -> tuple[Any, Any]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT started_at, ended_at FROM granola_notes WHERE granola_id = %s", (NOTE,))
+        return cur.fetchone()
+
+
+@pytest.mark.live
+def test_started_at_is_the_scheduled_time(clean: psycopg2.extensions.connection) -> None:
+    _store(clean, _raw(created_at="2026-09-20T09:00:00Z"))
+    parse_note(clean, NOTE)
+    clean.commit()
+    started, ended = _started_ended(clean)
+    assert started.isoformat() == "2026-09-01T12:00:00+00:00"
+    assert ended.isoformat() == "2026-09-01T12:45:00+00:00"
+
+
+@pytest.mark.live
+def test_started_at_falls_back_to_created_at_without_a_calendar_event(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """An ad hoc meeting has no calendar event. A NULL start drops it out of
+    every date-ranged query -- the monthly report missed 22 meetings that way."""
+    _store(clean, _raw(calendar_event=None))
+    parse_note(clean, NOTE)
+    clean.commit()
+    started, ended = _started_ended(clean)
+    assert started.isoformat() == "2026-09-01T09:00:00+00:00"
+    assert ended is None
+
+
+@pytest.mark.live
+def test_a_scheduled_end_without_a_scheduled_start_is_dropped(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """Beside a created_at proxy the scheduled end would predate the start, and
+    every duration query would see a negative interval."""
+    _store(
+        clean,
+        _raw(
+            created_at="2026-09-20T09:00:00Z",
+            calendar_event={
+                "scheduled_start_time": None,
+                "scheduled_end_time": "2026-09-01T12:45:00Z",
+            },
+        ),
+    )
+    with capture_logs() as logs:
+        parse_note(clean, NOTE)
+    clean.commit()
+    started, ended = _started_ended(clean)
+    assert started.isoformat() == "2026-09-20T09:00:00+00:00"
+    assert ended is None
+    assert [e for e in logs if e["log_level"] == "warning"] == [], "dropped by design, not a defect"
+
+
+@pytest.mark.live
+def test_an_unparseable_scheduled_start_falls_back_loudly(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """The fallback meeting_date already took. A proxy that can be days late is
+    logged rather than written silently."""
+    _store(
+        clean,
+        _raw(
+            calendar_event={
+                "scheduled_start_time": "not a date",
+                "scheduled_end_time": "2026-09-01T12:45:00Z",
+            }
+        ),
+    )
+    with capture_logs() as logs:
+        parse_note(clean, NOTE)
+    clean.commit()
+    started, ended = _started_ended(clean)
+    assert started.isoformat() == "2026-09-01T09:00:00+00:00"
+    assert ended is None
+    warnings = [e for e in logs if e["log_level"] == "warning"]
+    assert [(e["granola_id"], e["field"], e["value"]) for e in warnings] == [
+        (NOTE, "scheduled_start_time", "not a date")
+    ]
+
+
+@pytest.mark.live
+def test_an_unparseable_scheduled_end_is_dropped_loudly(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """Postgres used to reject the INSERT, failing the note until it
+    dead-lettered. The start is good, so the note is kept and the end logged."""
+    _store(
+        clean,
+        _raw(
+            calendar_event={
+                "scheduled_start_time": "2026-09-01T12:00:00Z",
+                "scheduled_end_time": "not a date",
+            }
+        ),
+    )
+    with capture_logs() as logs:
+        parse_note(clean, NOTE)
+    clean.commit()
+    started, ended = _started_ended(clean)
+    assert started.isoformat() == "2026-09-01T12:00:00+00:00"
+    assert ended is None
+    warnings = [e for e in logs if e["log_level"] == "warning"]
+    assert [(e["field"], e["value"]) for e in warnings] == [("scheduled_end_time", "not a date")]
+
+
+@pytest.mark.live
+def test_a_scheduled_start_with_no_end_is_not_logged(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """A missing end is ordinary, not malformed."""
+    _store(clean, _raw(calendar_event={"scheduled_start_time": "2026-09-01T12:00:00Z"}))
+    with capture_logs() as logs:
+        parse_note(clean, NOTE)
+    clean.commit()
+    assert _started_ended(clean)[1] is None
+    assert [e for e in logs if e["log_level"] == "warning"] == []
+
+
+@pytest.mark.live
+def test_started_at_and_meeting_date_are_both_null_without_a_timestamp(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    _store(clean, {**_raw(calendar_event={}, created_at=None)})
+    parse_note(clean, NOTE)
+    clean.commit()
+    assert _started_ended(clean) == (None, None)
+
+
+@pytest.mark.live
+def test_started_at_and_meeting_date_agree_without_a_calendar_event(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """Both come from note_timestamp, so a calendar-less note never has a
+    meeting_date without a start. They agree on the day for UTC-stamped notes;
+    meeting_date keeps the offset as written, started_at is an instant."""
+    _store(clean, _raw(calendar_event={}, created_at="2026-09-03T23:30:00Z"))
+    parse_note(clean, NOTE)
+    clean.commit()
+    with clean.cursor() as cur:
+        cur.execute(
+            "SELECT started_at AT TIME ZONE 'UTC', meeting_date FROM granola_notes "
+            "WHERE granola_id = %s",
+            (NOTE,),
+        )
+        started, day = cur.fetchone()
+    assert started.date() == day
 
 
 @pytest.mark.live
