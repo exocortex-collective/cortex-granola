@@ -21,7 +21,7 @@ import structlog
 from psycopg2 import sql
 from psycopg2.extras import Json, execute_values
 
-from cortex_granola.granola.render import calendar_event, note_timestamp
+from cortex_granola.granola.render import calendar_event, note_timestamp, scheduled_start
 
 log = structlog.get_logger(__name__)
 
@@ -109,9 +109,8 @@ def _clear_derived(conn: psycopg2.extensions.connection, granola_id: str) -> Non
 
 
 def _write_note(conn: psycopg2.extensions.connection, granola_id: str, raw: dict[str, Any]) -> None:
-    event = calendar_event(raw)
+    started, ended = _span(granola_id, raw)
     owner = raw.get("owner") or {}
-    when_at = note_timestamp(raw)
     when = _meeting_date(raw)
     transcript = raw.get("transcript") or []
 
@@ -133,12 +132,8 @@ def _write_note(conn: psycopg2.extensions.connection, granola_id: str, raw: dict
                 "title": raw.get("title"),
                 "owner": (owner.get("email") or "").strip() or None,
                 "web_url": raw.get("web_url"),
-                # The calendar start, else created_at -- Granola stamps that
-                # when recording begins, so an ad hoc meeting's start is not
-                # unknown. Same precedence as meeting_date, from one function.
-                "start": when_at,
-                # No fallback: nothing in a calendar-less note says when it ended.
-                "end": event.get("scheduled_end_time"),
+                "start": started,
+                "end": ended,
                 # The date the export worker files this note under, or NULL --
                 # see _meeting_date.
                 "date": when,
@@ -150,6 +145,32 @@ def _write_note(conn: psycopg2.extensions.connection, granola_id: str, raw: dict
                 "has_transcript": bool(transcript),
             },
         )
+
+
+def _span(granola_id: str, raw: dict[str, Any]) -> tuple[dt.datetime | None, Any]:
+    """started_at and ended_at.
+
+    The start is note_timestamp's: the calendar start, else created_at as a
+    proxy -- for an ad hoc meeting, roughly when the note was opened. A NULL
+    start drops the meeting out of every date-ranged query, and a proxy is
+    better than that.
+
+    The end is the scheduled end only when the start is the scheduled start.
+    Beside a created_at proxy it could predate the start, and nothing in a
+    calendar-less note says when the meeting ended.
+    """
+    scheduled = scheduled_start(raw)
+    event = calendar_event(raw)
+    if scheduled is None and event.get("scheduled_start_time"):
+        # The same fallback meeting_date has always taken; logged because a
+        # proxy that can be days late should not arrive silently.
+        log.warning(
+            "unparseable scheduled_start_time, falling back to created_at",
+            granola_id=granola_id,
+            value=event.get("scheduled_start_time"),
+        )
+    end = event.get("scheduled_end_time") if scheduled else None
+    return note_timestamp(raw), end
 
 
 def _meeting_date(raw: dict[str, Any]) -> dt.date | None:

@@ -13,6 +13,7 @@ from typing import Any
 import psycopg2
 import pytest
 from psycopg2.extras import Json
+from structlog.testing import capture_logs
 
 from cortex_granola.parse import RawNoteMissingError, parse_note
 
@@ -137,10 +138,70 @@ def test_started_at_falls_back_to_created_at_without_a_calendar_event(
 
 
 @pytest.mark.live
+def test_a_scheduled_end_without_a_scheduled_start_is_dropped(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """Beside a created_at proxy the scheduled end would predate the start, and
+    every duration query would see a negative interval."""
+    _store(
+        clean,
+        _raw(
+            created_at="2026-09-20T09:00:00Z",
+            calendar_event={
+                "scheduled_start_time": None,
+                "scheduled_end_time": "2026-09-01T12:45:00Z",
+            },
+        ),
+    )
+    parse_note(clean, NOTE)
+    clean.commit()
+    started, ended = _started_ended(clean)
+    assert started.isoformat() == "2026-09-20T09:00:00+00:00"
+    assert ended is None
+
+
+@pytest.mark.live
+def test_an_unparseable_scheduled_start_falls_back_loudly(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """The fallback meeting_date already took. A proxy that can be days late is
+    logged rather than written silently."""
+    _store(
+        clean,
+        _raw(
+            calendar_event={
+                "scheduled_start_time": "not a date",
+                "scheduled_end_time": "2026-09-01T12:45:00Z",
+            }
+        ),
+    )
+    with capture_logs() as logs:
+        parse_note(clean, NOTE)
+    clean.commit()
+    started, ended = _started_ended(clean)
+    assert started.isoformat() == "2026-09-01T09:00:00+00:00"
+    assert ended is None
+    warnings = [e for e in logs if e["log_level"] == "warning"]
+    assert [(e["granola_id"], e["value"]) for e in warnings] == [(NOTE, "not a date")]
+
+
+@pytest.mark.live
+def test_started_at_is_null_only_when_meeting_date_is(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    _store(clean, {**_raw(calendar_event={}, created_at=None)})
+    parse_note(clean, NOTE)
+    clean.commit()
+    assert _started_ended(clean) == (None, None)
+
+
+@pytest.mark.live
 def test_started_at_and_meeting_date_agree_without_a_calendar_event(
     clean: psycopg2.extensions.connection,
 ) -> None:
-    """Both come from note_timestamp, so they cannot name different days."""
+    """Both come from note_timestamp, so a calendar-less note never has a
+    meeting_date without a start. They agree on the day for UTC-stamped notes;
+    meeting_date keeps the offset as written, started_at is an instant."""
     _store(clean, _raw(calendar_event={}, created_at="2026-09-03T23:30:00Z"))
     parse_note(clean, NOTE)
     clean.commit()
