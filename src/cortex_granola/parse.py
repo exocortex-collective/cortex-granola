@@ -111,6 +111,7 @@ def _clear_derived(conn: psycopg2.extensions.connection, granola_id: str) -> Non
 def _write_note(conn: psycopg2.extensions.connection, granola_id: str, raw: dict[str, Any]) -> None:
     event = calendar_event(raw)
     owner = raw.get("owner") or {}
+    when_at = note_timestamp(raw)
     when = _meeting_date(raw)
     transcript = raw.get("transcript") or []
 
@@ -132,7 +133,11 @@ def _write_note(conn: psycopg2.extensions.connection, granola_id: str, raw: dict
                 "title": raw.get("title"),
                 "owner": (owner.get("email") or "").strip() or None,
                 "web_url": raw.get("web_url"),
-                "start": event.get("scheduled_start_time"),
+                # The calendar start, else created_at -- Granola stamps that
+                # when recording begins, so an ad hoc meeting's start is not
+                # unknown. Same precedence as meeting_date, from one function.
+                "start": when_at,
+                # No fallback: nothing in a calendar-less note says when it ended.
                 "end": event.get("scheduled_end_time"),
                 # The date the export worker files this note under, or NULL --
                 # see _meeting_date.

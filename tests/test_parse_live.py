@@ -106,6 +106,54 @@ def test_meeting_date_prefers_the_scheduled_time(clean: psycopg2.extensions.conn
         assert str(cur.fetchone()[0]) == "2026-09-01"
 
 
+def _started_ended(conn: psycopg2.extensions.connection) -> tuple[Any, Any]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT started_at, ended_at FROM granola_notes WHERE granola_id = %s", (NOTE,))
+        return cur.fetchone()
+
+
+@pytest.mark.live
+def test_started_at_is_the_scheduled_time(clean: psycopg2.extensions.connection) -> None:
+    _store(clean, _raw(created_at="2026-09-20T09:00:00Z"))
+    parse_note(clean, NOTE)
+    clean.commit()
+    started, ended = _started_ended(clean)
+    assert started.isoformat() == "2026-09-01T12:00:00+00:00"
+    assert ended.isoformat() == "2026-09-01T12:45:00+00:00"
+
+
+@pytest.mark.live
+def test_started_at_falls_back_to_created_at_without_a_calendar_event(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """An ad hoc meeting has no calendar event. A NULL start drops it out of
+    every date-ranged query -- the monthly report missed 22 meetings that way."""
+    _store(clean, _raw(calendar_event=None))
+    parse_note(clean, NOTE)
+    clean.commit()
+    started, ended = _started_ended(clean)
+    assert started.isoformat() == "2026-09-01T09:00:00+00:00"
+    assert ended is None
+
+
+@pytest.mark.live
+def test_started_at_and_meeting_date_agree_without_a_calendar_event(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """Both come from note_timestamp, so they cannot name different days."""
+    _store(clean, _raw(calendar_event={}, created_at="2026-09-03T23:30:00Z"))
+    parse_note(clean, NOTE)
+    clean.commit()
+    with clean.cursor() as cur:
+        cur.execute(
+            "SELECT started_at AT TIME ZONE 'UTC', meeting_date FROM granola_notes "
+            "WHERE granola_id = %s",
+            (NOTE,),
+        )
+        started, day = cur.fetchone()
+    assert started.date() == day
+
+
 @pytest.mark.live
 def test_an_attendee_appearing_twice_keeps_the_named_version(
     clean: psycopg2.extensions.connection,
