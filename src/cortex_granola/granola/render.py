@@ -63,6 +63,11 @@ def scheduled_start(note: JsonDict) -> dt.datetime | None:
     return _parse_ts(calendar_event(note).get("scheduled_start_time"))
 
 
+def scheduled_end(note: JsonDict) -> dt.datetime | None:
+    """The calendar event's end, or None when it is missing or unparseable."""
+    return _parse_ts(calendar_event(note).get("scheduled_end_time"))
+
+
 def calendar_event(note: JsonDict) -> JsonDict:
     """The calendar event, or {} when there is none. A wrong type raises.
 

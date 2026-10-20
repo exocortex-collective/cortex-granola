@@ -25,6 +25,8 @@ from cortex_granola.granola.render import (
     relative_path,
     render_note,
     render_transcript,
+    scheduled_end,
+    scheduled_start,
     slugify,
 )
 
@@ -120,6 +122,24 @@ def test_note_timestamp_skips_an_unparseable_scheduled_start() -> None:
         )
     )
     assert result == dt.datetime(2026, 1, 27, 15, 30, tzinfo=dt.UTC)
+
+
+@pytest.mark.parametrize(
+    "event",
+    [None, {}, {"scheduled_start_time": None}, {"scheduled_start_time": "not a date"}],
+)
+def test_scheduled_start_is_none_without_a_usable_calendar_start(event: Any) -> None:
+    assert scheduled_start(note(calendar_event=event, created_at="2026-01-27T15:30:00Z")) is None
+
+
+def test_scheduled_start_and_end_parse_the_calendar_event() -> None:
+    event = {
+        "scheduled_start_time": "2026-01-27T09:00:00-07:00",
+        "scheduled_end_time": "not a date",
+    }
+    n = note(calendar_event=event)
+    assert scheduled_start(n) == dt.datetime(2026, 1, 27, 16, 0, tzinfo=dt.UTC)
+    assert scheduled_end(n) is None
 
 
 def test_note_timestamp_is_none_when_nothing_is_usable() -> None:

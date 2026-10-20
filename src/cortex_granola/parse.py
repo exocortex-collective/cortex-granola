@@ -21,7 +21,12 @@ import structlog
 from psycopg2 import sql
 from psycopg2.extras import Json, execute_values
 
-from cortex_granola.granola.render import calendar_event, note_timestamp, scheduled_start
+from cortex_granola.granola.render import (
+    calendar_event,
+    note_timestamp,
+    scheduled_end,
+    scheduled_start,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -147,7 +152,7 @@ def _write_note(conn: psycopg2.extensions.connection, granola_id: str, raw: dict
         )
 
 
-def _span(granola_id: str, raw: dict[str, Any]) -> tuple[dt.datetime | None, Any]:
+def _span(granola_id: str, raw: dict[str, Any]) -> tuple[dt.datetime | None, dt.datetime | None]:
     """started_at and ended_at.
 
     The start is note_timestamp's: the calendar start, else created_at as a
@@ -160,17 +165,25 @@ def _span(granola_id: str, raw: dict[str, Any]) -> tuple[dt.datetime | None, Any
     calendar-less note says when the meeting ended.
     """
     scheduled = scheduled_start(raw)
+    end = scheduled_end(raw) if scheduled else None
     event = calendar_event(raw)
+    # A value present but unparseable is logged: a start that falls back to a
+    # proxy days late, or an end quietly dropped, should not arrive silently.
+    # An end beside no scheduled start is dropped by design and not logged.
     if scheduled is None and event.get("scheduled_start_time"):
-        # The same fallback meeting_date has always taken; logged because a
-        # proxy that can be days late should not arrive silently.
-        log.warning(
-            "unparseable scheduled_start_time, falling back to created_at",
-            granola_id=granola_id,
-            value=event.get("scheduled_start_time"),
-        )
-    end = event.get("scheduled_end_time") if scheduled else None
+        _warn_unparseable(granola_id, "scheduled_start_time", event)
+    if scheduled and end is None and event.get("scheduled_end_time"):
+        _warn_unparseable(granola_id, "scheduled_end_time", event)
     return note_timestamp(raw), end
+
+
+def _warn_unparseable(granola_id: str, field: str, event: dict[str, Any]) -> None:
+    log.warning(
+        "unparseable calendar time, not stored",
+        granola_id=granola_id,
+        field=field,
+        value=event.get(field),
+    )
 
 
 def _meeting_date(raw: dict[str, Any]) -> dt.date | None:

@@ -153,11 +153,13 @@ def test_a_scheduled_end_without_a_scheduled_start_is_dropped(
             },
         ),
     )
-    parse_note(clean, NOTE)
+    with capture_logs() as logs:
+        parse_note(clean, NOTE)
     clean.commit()
     started, ended = _started_ended(clean)
     assert started.isoformat() == "2026-09-20T09:00:00+00:00"
     assert ended is None
+    assert [e for e in logs if e["log_level"] == "warning"] == [], "dropped by design, not a defect"
 
 
 @pytest.mark.live
@@ -182,11 +184,38 @@ def test_an_unparseable_scheduled_start_falls_back_loudly(
     assert started.isoformat() == "2026-09-01T09:00:00+00:00"
     assert ended is None
     warnings = [e for e in logs if e["log_level"] == "warning"]
-    assert [(e["granola_id"], e["value"]) for e in warnings] == [(NOTE, "not a date")]
+    assert [(e["granola_id"], e["field"], e["value"]) for e in warnings] == [
+        (NOTE, "scheduled_start_time", "not a date")
+    ]
 
 
 @pytest.mark.live
-def test_started_at_is_null_only_when_meeting_date_is(
+def test_an_unparseable_scheduled_end_is_dropped_loudly(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """Postgres used to reject the INSERT, failing the note until it
+    dead-lettered. The start is good, so the note is kept and the end logged."""
+    _store(
+        clean,
+        _raw(
+            calendar_event={
+                "scheduled_start_time": "2026-09-01T12:00:00Z",
+                "scheduled_end_time": "not a date",
+            }
+        ),
+    )
+    with capture_logs() as logs:
+        parse_note(clean, NOTE)
+    clean.commit()
+    started, ended = _started_ended(clean)
+    assert started.isoformat() == "2026-09-01T12:00:00+00:00"
+    assert ended is None
+    warnings = [e for e in logs if e["log_level"] == "warning"]
+    assert [(e["field"], e["value"]) for e in warnings] == [("scheduled_end_time", "not a date")]
+
+
+@pytest.mark.live
+def test_started_at_and_meeting_date_are_both_null_without_a_timestamp(
     clean: psycopg2.extensions.connection,
 ) -> None:
     _store(clean, {**_raw(calendar_event={}, created_at=None)})
